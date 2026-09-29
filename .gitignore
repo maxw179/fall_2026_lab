@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.aux
+*.log
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+# Original utility archive; extracted source is versioned.
+utils.zip

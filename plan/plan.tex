@@ -1,0 +1,48 @@
+\documentclass{article}
+
+\usepackage{float}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{graphicx} % Required for inserting images
+\usepackage{booktabs} % For professional-looking table rules
+\usepackage{caption} % The booktabs package will give you nicer line spacing, but if you don't care about the spacing, you can use the standard hline command
+\usepackage{subcaption} % For creating subfigures and subtables
+\usepackage{float} % The standard floats.
+\usepackage{mathrsfs}
+\usepackage{footnote}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=red,
+    filecolor=red,      
+    urlcolor=red,
+    citecolor=red
+    }
+
+\urlstyle{same}
+\usepackage[left=4cm, right=4cm, top = 3cm, bottom = 3cm]{geometry}
+
+
+\title{Phase Diversity Adaptive Optics for Three-Photon Microscopy}
+\author{ Max Watzky\footnote{Departments of Physics and Mathematics, Yale University} \ and Cristina Rodr\(\'{\i}\)guez\footnote{Departments of Applied Physics and Biomedical Engineering, Yale University}}
+\date{September 11th, 2026}
+
+\begin{document}
+\maketitle
+
+Adaptive optics (AO) is a class of techniques by which sample aberrations and optical imperfections can be corrected using a deformable mirror or spatial light modulator. 
+Traditional approaches in AO for three-photon (3P) microscopy 
+involve introducing linear combinations of known aberrations into the imaging train, and iterating over the coefficients until the image quality is maximized. More recently, 
+statistical and machine learning techniques have been employed to infer aberrations directly by marginalizing over the underlying sample. However, these methods often rely on synthetic training datasets, and fail in out-of-sample tasks. Phase diversity (PD) is a 
+promising physics-informed optimization technique for AO which incorporates the forward model of image generation into the task of aberration inference. However, the assumptions made by current formalisms for PD – namely, that the sample is two-dimensional, and the excitation is linear –
+are violated in 3P deep-tissue imaging. 
+
+In my research with the Rodr\(\'{\i}\)guez lab this semester, I will adapt the mathematical formalism of PD to work with three-dimensional samples with nonlinear excitation. I will then test this formalism using optics simulations in Python,
+in order to evaluate the effectiveness of the technique.  Later in the semester, I will attempt to optimize the process of image acquisition for PD by engineering the shape of the microscope point-spread function. Time-permitting, I also hope to test the PD technique on the lab's 3P microscope, first with idealized fluorobead samples and then with \textit{in vivo} mouse imaging.
+
+
+
+
+\end{document}
