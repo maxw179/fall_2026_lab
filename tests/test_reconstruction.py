@@ -88,6 +88,32 @@ class ReconstructionTests(unittest.TestCase):
                 np.testing.assert_array_equal(sample.z_levels, sample_z)
                 np.testing.assert_array_equal(sample.get_xy()[0], grid.get_xy()[0])
 
+    def test_fourier_loss_matches_spatial_energy(self):
+        from optimization.reconstruction import _fourier_loss
+        rng = np.random.default_rng(42)
+        for shape in [(4, 5), (5, 4), (3, 1)]:
+            residual = rng.normal(size=(2, *shape))
+            sample = rng.normal(size=(3, *shape))
+            actual = _fourier_loss(
+                np.fft.rfft2(residual).reshape(2, -1),
+                np.fft.rfft2(sample).reshape(3, -1), .13, shape)
+            expected = np.prod(shape) * (np.sum(residual**2) + .13*np.sum(sample**2))
+            np.testing.assert_allclose(actual, expected, rtol=1e-14)
+
+    def test_kernel_transform_wraps_and_reuses_buffer(self):
+        from optimization.reconstruction import _KernelTransform
+        rng = np.random.default_rng(43)
+        for shape in [(4, 5), (9, 8)]:
+            transform = _KernelTransform(shape)
+            for kernel_shape in [(5, 5), (5, 5), (11, 13), (3, 3)]:
+                kernel = rng.normal(size=kernel_shape)
+                periodic = np.zeros(shape)
+                for (x, y), value in np.ndenumerate(kernel):
+                    periodic[(x-kernel_shape[0]//2) % shape[0],
+                             (y-kernel_shape[1]//2) % shape[1]] += value
+                np.testing.assert_allclose(
+                    transform(kernel), np.fft.rfft2(periodic).ravel(), atol=1e-13)
+
     def test_invalid_inputs(self):
         m = Microscope(1,.0013,1.333,1.05,7.2,4,3.5,15.12,16)
         g = Arbitrary_Grid(.01,.01,3,3,0,0,0)

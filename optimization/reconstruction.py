@@ -1,3 +1,5 @@
+"""Regularized 3D reconstruction and analytic aberration optimization."""
+
 from __future__ import annotations
 
 from typing import Literal, Sequence
@@ -7,36 +9,6 @@ from utils.psf import (Arbitrary_Grid, Image_Mask, Image_Mask_3D, Microscope,
 from utils.zernike import Aberration, EmptyAberration
 
 
-"""
-Estimates a 3D sample using the regularized Gaussian object estimator in math.tex.
-Zero-pads the acquired stack, applies the frequency-wise regularized SVD solve,
-and crops the estimate to the original lateral grid. 
-Zero padding assumes zero measured signal outside the acquired field, so we get
-an approximation for cropped data. Acquiring a larger field and cropping after
-reconstruction is preferable when appreciable signal reaches the original edges.
-The unconstrained estimate can be negative.
-No PSF normalization or axial integration weights are applied.
-Params:
-    microscope (Microscope): optical parameters used to predict the PSFs
-    grid (Arbitrary_Grid): shared lateral sampling of the acquired images
-    images (np.ndarray): real, finite acquired data with shape (K, x, y)
-    focal_z_levels (Sequence[float] | np.ndarray): acquisition focal positions [mm]
-    sample_z_levels (Sequence[float] | np.ndarray): distinct reconstruction planes [mm]
-    aberration (Aberration): guessed common aberration
-    rho (float): strictly positive regularization in the raw PSF Fourier scale
-    diversities (Sequence[Aberration] | None): known additional aberrations for each
-        acquired image; None uses zero diversity for all K images
-    mode (Literal["scalar", "vector"]): optical model matching the data
-    frequency_batch_size (int): maximum spatial frequencies solved together
-    padding (int | tuple[int, int] | None): pixels added to each side of x and y;
-        None uses half the PSF size on each axis; zero gives the unpadded solver
-    return_info (bool): whether to also return padded-domain fit diagnostics
-Returns:
-    sample (Image_Mask_3D): real-valued estimate at the requested P planes
-    info (dict): returned alongside sample only when return_info is True;
-        includes padding, padded shape, relative data residuals, and the
-        regularized full Fourier-sum loss before cropping
-"""
 def estimate_sample_3D(microscope: Microscope, grid: Arbitrary_Grid,
                        images: np.ndarray,
                        focal_z_levels: Sequence[float] | np.ndarray,
@@ -47,6 +19,36 @@ def estimate_sample_3D(microscope: Microscope, grid: Arbitrary_Grid,
                        frequency_batch_size: int = 4096,
                        padding: int | tuple[int, int] | None = None,
                        return_info: bool = False):
+    """
+    Estimates a 3D sample using the regularized Gaussian object estimator in math.tex.
+    Zero-pads the acquired stack, applies the frequency-wise regularized SVD solve,
+    and crops the estimate to the original lateral grid.
+    Zero padding assumes zero measured signal outside the acquired field, so we get
+    an approximation for cropped data. Acquiring a larger field and cropping after
+    reconstruction is preferable when appreciable signal reaches the original edges.
+    The unconstrained estimate can be negative.
+    No PSF normalization or axial integration weights are applied.
+    Params:
+        microscope (Microscope): optical parameters used to predict the PSFs
+        grid (Arbitrary_Grid): shared lateral sampling of the acquired images
+        images (np.ndarray): real, finite acquired data with shape (K, x, y)
+        focal_z_levels (Sequence[float] | np.ndarray): acquisition focal positions [mm]
+        sample_z_levels (Sequence[float] | np.ndarray): distinct reconstruction planes [mm]
+        aberration (Aberration): guessed common aberration
+        rho (float): strictly positive regularization in the raw PSF Fourier scale
+        diversities (Sequence[Aberration] | None): known additional aberrations for each
+            acquired image; None uses zero diversity for all K images
+        mode (Literal["scalar", "vector"]): optical model matching the data
+        frequency_batch_size (int): maximum spatial frequencies solved together
+        padding (int | tuple[int, int] | None): pixels added to each side of x and y;
+            None uses half the PSF size on each axis; zero gives the unpadded solver
+        return_info (bool): whether to also return padded-domain fit diagnostics
+    Returns:
+        sample (Image_Mask_3D): real-valued estimate at the requested P planes
+        info (dict): returned alongside sample only when return_info is True;
+            includes padding, padded shape, relative data residuals, and the
+            regularized full Fourier-sum loss before cropping
+    """
     otfs, observed, estimated, shape, crop, sample_z, data, (px, py) = _solve_reconstruction(
         microscope, grid, images, focal_z_levels, sample_z_levels,
         aberration, rho, diversities, mode, frequency_batch_size, padding)
@@ -59,7 +61,7 @@ def estimate_sample_3D(microscope: Microscope, grid: Arbitrary_Grid,
         norm_data = np.linalg.norm(data)
         measured_norm = np.linalg.norm(np.asarray(images))
         info = dict(padding=(px, py), padded_shape=shape,
-                    loss=float(np.prod(shape) * (np.sum(residual**2) + rho*np.sum(result**2))),
+                    loss=_fourier_loss(observed - predicted, estimated, rho, shape),
                     relative_residual=float(np.linalg.norm(residual)/norm_data) if norm_data else 0.0,
                     measured_relative_residual=float(np.linalg.norm(residual[crop])/measured_norm) if measured_norm else 0.0)
         # Residuals describe the padded estimate before cropping, including its
@@ -79,7 +81,7 @@ def evaluate_loss_3D(microscope: Microscope, grid: Arbitrary_Grid,
                      padding: int | tuple[int, int] | None = None) -> float:
     """Evaluate the regularized Gaussian loss at a given aberration.
 
-    Fits the sample using ``estimate_sample_3D`` and returns
+    Fits the sample with the same solver as ``estimate_sample_3D`` and returns
     sum(|D - S F_hat|**2) + rho * sum(|F_hat|**2), as in math.tex.
     Sums cover the full lateral Fourier grid using NumPy's unnormalized
     forward FFT convention. By Parseval's identity this is the spatial
@@ -89,11 +91,51 @@ def evaluate_loss_3D(microscope: Microscope, grid: Arbitrary_Grid,
     Arguments and validation match ``estimate_sample_3D``. Keep padding
     fixed when comparing losses across aberrations.
     """
-    _, info = estimate_sample_3D(
+    otfs, observed, estimated, shape, *_ = _solve_reconstruction(
         microscope, grid, images, focal_z_levels, sample_z_levels,
-        aberration, rho, diversities, mode, frequency_batch_size, padding,
-        return_info=True)
-    return info['loss']
+        aberration, rho, diversities, mode, frequency_batch_size, padding)
+    residual = observed - np.einsum('kpf,pf->kf', otfs, estimated)
+    return _fourier_loss(residual, estimated, rho, shape)
+
+
+def _frequency_weights(shape):
+    """Multiplicity of each stored real-FFT bin in the full Fourier sum."""
+    weights = np.full((shape[0], shape[1] // 2 + 1), 2.0)
+    weights[:, 0] = 1
+    if shape[1] % 2 == 0:
+        weights[:, -1] = 1
+    return weights.ravel()
+
+
+def _fourier_loss(residual, estimated, rho, shape):
+    return float(np.sum(_frequency_weights(shape) * (
+        np.sum(abs(residual)**2, axis=0)
+        + rho * np.sum(abs(estimated)**2, axis=0))))
+
+
+class _KernelTransform:
+    """Reuse wrapping indices and a periodic buffer for a stack of PSFs."""
+
+    def __init__(self, shape):
+        self.shape = shape
+        self.periodic = np.zeros(shape)
+        self.kernel_shape = None
+
+    def __call__(self, kernel):
+        if kernel.shape != self.kernel_shape:
+            self.kernel_shape = kernel.shape
+            ix, iy = [(np.arange(n) - n // 2) % size
+                      for n, size in zip(kernel.shape, self.shape)]
+            self.indices = (ix[:, None], iy[None, :])
+            self.unique = all(n <= size for n, size in zip(kernel.shape, self.shape))
+        self.periodic.fill(0)
+        if self.unique:
+            self.periodic[self.indices] = kernel
+        else:
+            # On unpadded even axes the odd kernel has N+1 samples;
+            # boundary samples represent the same periodic displacement.
+            np.add.at(self.periodic, self.indices, kernel)
+        return np.fft.rfft2(self.periodic).ravel()
 
 
 def _solve_reconstruction(microscope, grid, images, focal_z_levels,
@@ -129,18 +171,13 @@ def _solve_reconstruction(microscope, grid, images, focal_z_levels,
     crop = (slice(None), slice(px, px + original_shape[0]), slice(py, py + original_shape[1]))
     # Store OTFs as (K, P, frequencies); frequency batches limit SVD workspace.
     otfs = np.empty((len(focal_z), len(sample_z), shape[0]*(shape[1]//2+1)), dtype=np.complex128)
+    transform = _KernelTransform(shape)
     for k, (focus, diversity) in enumerate(zip(focal_z, diversities)):
+        combined = aberration + diversity
         for i, level in enumerate(sample_z):
             _, _, kernel = microscope.compute_PSF(
-                _grid_at_z(kernel_grid, level - focus), aberration + diversity, mode)
-            # Wrap integer displacements into the periodic image domain.
-            # On even image axes the odd kernel has N+1 samples; its two
-            # boundary samples represent the same periodic displacement.
-            periodic = np.zeros(shape)
-            ix = np.asarray((np.arange(kernel.shape[0])-kernel.shape[0]//2) % shape[0])
-            iy = np.asarray((np.arange(kernel.shape[1])-kernel.shape[1]//2) % shape[1])
-            np.add.at(periodic, (ix[:, None], iy[None, :]), kernel)
-            otfs[k, i] = np.fft.rfft2(periodic).reshape(-1)
+                _grid_at_z(kernel_grid, level - focus), combined, mode)
+            otfs[k, i] = transform(kernel)
     observed = np.fft.rfft2(np.asarray(data)).reshape(len(focal_z), -1)
     estimated = np.empty((len(sample_z), observed.shape[1]), dtype=np.complex128)
     for start in range(0, observed.shape[1], frequency_batch_size):
@@ -155,12 +192,8 @@ def _solve_reconstruction(microscope, grid, images, focal_z_levels,
     return otfs, observed, estimated, shape, crop, sample_z, data, (px, py)
 
 
-def _psf_derivatives(microscope, grid, aberration, modes, mode):
-    """Yield first and upper-triangular second PSF derivatives in waves.
-
-    Differentiate the pupil propagation used in utils.rw analytically.
-    Component sums extend the scalar formulas in math.tex to vector fields.
-    """
+def _derivative_geometry(microscope, grid, modes, mode):
+    """Prepare phase-independent pupil geometry once per derivative evaluation."""
     from utils.rw import (get_bfp_grid, bfp_coord_convert,
                           gaussian_amplitude_s_perp, strength_angular)
 
@@ -169,9 +202,7 @@ def _psf_derivatives(microscope, grid, aberration, modes, mode):
     mask, theta, phi, sx, sy, sz = bfp_coord_convert(m.f, m.n, m.alpha, x, y)
     pupil = np.zeros_like(x, dtype=complex)
     gauss = gaussian_amplitude_s_perp(m.mag, m.w_0, m.f, m.n, np.sqrt(sx**2 + sy**2))
-    pupil[mask] = gauss[mask] * np.exp(1j * (
-        aberration.construct_map(m.alpha)(theta[mask], phi[mask])
-        + m.k * grid.z_level * sz[mask]))
+    pupil[mask] = gauss[mask]
     if mode == 'scalar':
         pupils = pupil[None]
         scale = (sx[1, 0]-sx[0, 0]) * (sy[0, 1]-sy[0, 0])
@@ -195,20 +226,40 @@ def _psf_derivatives(microscope, grid, aberration, modes, mode):
         z = np.zeros_like(theta)
         z[mask] = Aberration([zmode], [1]).construct_map(m.alpha)(theta[mask], phi[mask])
         basis.append(z)
+    return pupils, mask, theta, phi, sz, basis, propagate
+
+
+def _psf_derivatives(microscope, grid, aberration, modes, mode, geometry=None):
+    """Yield first and upper-triangular second PSF derivatives in waves.
+
+    Differentiate pupil propagation analytically, summing vector components
+    before applying the multiphoton order. Geometry is local to this call's
+    optical setup, so changes to mutable microscopes cannot leave stale caches.
+    """
+    if geometry is None:
+        geometry = _derivative_geometry(microscope, grid, modes, mode)
+    amplitudes, mask, theta, phi, sz, basis, propagate = geometry
+    phase = np.zeros_like(theta, dtype=complex)
+    phase[mask] = np.exp(1j * (
+        aberration.construct_map(microscope.alpha)(theta[mask], phi[mask])
+        + microscope.k * grid.z_level * sz[mask]))
+    pupils = amplitudes * phase
     field = propagate(pupils)
     first = [propagate(1j*z*pupils) for z in basis]
     intensity = np.sum(np.abs(field)**2, axis=0)
     d_intensity = [2*np.real(np.sum(field.conj()*d, axis=0)) for d in first]
-    N = m.N_order
+    N = microscope.N_order
+    first_factor = N * intensity**(N-1)
+    second_factor = N*(N-1)*intensity**(N-2) if N != 1 else None
     for j, d in enumerate(d_intensity):
-        yield j, None, N * intensity**(N-1) * d
+        yield j, None, first_factor * d
     for j in range(len(modes)):
         for l in range(j, len(modes)):
             second = propagate(-basis[j]*basis[l]*pupils)
             dd_intensity = 2*np.real(np.sum(first[j].conj()*first[l] + field.conj()*second, axis=0))
-            dd = N * intensity**(N-1) * dd_intensity
+            dd = first_factor * dd_intensity
             if N != 1:
-                dd += N*(N-1)*intensity**(N-2)*d_intensity[j]*d_intensity[l]
+                dd += second_factor*d_intensity[j]*d_intensity[l]
             yield j, l, dd
 
 
@@ -239,14 +290,8 @@ def evaluate_loss_derivatives_3D(microscope: Microscope, grid: Arbitrary_Grid,
         microscope, grid, images, focal_z_levels, sample_z_levels,
         aberration, rho, diversities, mode, frequency_batch_size, padding)
     r = D - np.einsum('kpf,pf->kf', S, F)
-    # rfft omits negative y frequencies. DC and even-width Nyquist occur once.
-    weights = np.full((shape[0], shape[1]//2+1), 2.0)
-    weights[:, 0] = 1
-    if shape[1] % 2 == 0:
-        weights[:, -1] = 1
-    weights = weights.ravel()
-    loss = float(np.sum(weights * (np.sum(abs(r)**2, axis=0)
-                                  + rho*np.sum(abs(F)**2, axis=0))))
+    weights = _frequency_weights(shape)
+    loss = _fourier_loss(r, F, rho, shape)
     M = len(aberration)
     dS = np.empty((M, *S.shape), dtype=complex)
     gradient = np.zeros(M)
@@ -254,16 +299,15 @@ def evaluate_loss_derivatives_3D(microscope: Microscope, grid: Arbitrary_Grid,
     kernel_grid = _convolution_grid(grid)
     if diversities is None:
         diversities = [EmptyAberration()] * len(D)
+    transform = _KernelTransform(shape)
+    geometry = _derivative_geometry(microscope, kernel_grid, aberration.modes, mode)
     for k, (focus, diversity) in enumerate(zip(_z_array(focal_z_levels), diversities)):
+        combined = aberration + diversity
         for p, level in enumerate(sample_z):
             for j, l, kernel in _psf_derivatives(
                     microscope, _grid_at_z(kernel_grid, level-focus),
-                    aberration + diversity, aberration.modes, mode):
-                periodic = np.zeros(shape)
-                ix = (np.arange(kernel.shape[0])-kernel.shape[0]//2) % shape[0]
-                iy = (np.arange(kernel.shape[1])-kernel.shape[1]//2) % shape[1]
-                np.add.at(periodic, (ix[:, None], iy[None, :]), kernel)
-                otf = np.fft.rfft2(periodic).ravel()
+                    combined, aberration.modes, mode, geometry):
+                otf = transform(kernel)
                 if l is None:
                     dS[j, k, p] = otf
                 else:
