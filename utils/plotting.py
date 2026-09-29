@@ -9,6 +9,112 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from utils.psf import Image_Mask_3D
 
 
+def animate_reconstruction(info: dict, modes, microscope, *,
+                           interval: float = 500, threshold: float | None = None,
+                           percentile: float = 98, stride: int = 1,
+                           res: int = 150, dpi: int = 100,
+                           **reconstruction_kwargs):
+    """Animate recorded optimizer iterates using zernike_plot and plot_sample_3D.
+
+    Pass info from optimize_aberration_3D, its modes in the same order, and
+    the original microscope. Supply grid, images, focal_z_levels,
+    sample_z_levels, rho, diversities, and any nondefault mode/padding settings
+    as reconstruction_kwargs. Objects are refitted once per selected iterate;
+    rendering and replay do not rerun reconstruction. No optimization is run.
+
+    Returns (aberration_animation, object_animation), two FuncAnimations.
+    In notebooks use display(HTML(animation.to_jshtml())). Keep references
+    to both animations; save with animation.save("name.gif", writer="pillow").
+    Frames represent iterations, not elapsed wall time; interval is in ms.
+    stride subsamples history while always including its final entry.
+
+    By default a fixed threshold is the given percentile of the final selected
+    object's values, matching the notebooks' percentile-based voxel plots.
+    An explicit threshold overrides this. Object colors share one scale across
+    all frames; phase colors retain zernike_plot's [-pi, pi] rad scale.
+    Frames are rendered to RGB snapshots to retain the existing plot styles
+    without rebuilding voxel artists during playback. Memory grows with frame
+    count and dpi; use stride and dpi to reduce it. Figures are closed so only
+    the requested notebook animations are displayed.
+    """
+    from matplotlib.animation import FuncAnimation
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from optimization.reconstruction import estimate_sample_3D
+    from utils.zernike import Aberration
+
+    history = info.get("history", [])
+    if not history:
+        raise ValueError("info must contain a nonempty optimizer history.")
+    if not isinstance(stride, (int, np.integer)) or stride < 1:
+        raise ValueError("stride must be a positive integer.")
+    if not np.isfinite(interval) or interval <= 0:
+        raise ValueError("interval must be finite and positive.")
+    if not 0 <= percentile <= 100:
+        raise ValueError("percentile must be between 0 and 100.")
+    if threshold is not None and not np.isfinite(threshold):
+        raise ValueError("threshold must be finite.")
+    if res < 2 or dpi <= 0:
+        raise ValueError("res must be at least 2 and dpi must be positive.")
+    if "aberration" in reconstruction_kwargs or "return_info" in reconstruction_kwargs:
+        raise ValueError("aberration and return_info are managed by this helper.")
+    indices = sorted(set(range(0, len(history), stride)) | {len(history) - 1})
+    entries = [history[i] for i in indices]
+    aberrations = []
+    for entry in entries:
+        strengths = np.asarray(entry["strengths"], dtype=float)
+        if strengths.shape != (len(modes),) or not np.all(np.isfinite(strengths)):
+            raise ValueError("History strengths must match modes and be finite.")
+        aberrations.append(Aberration(modes, strengths))
+    samples = [estimate_sample_3D(microscope=microscope, aberration=a,
+                                  **reconstruction_kwargs) for a in aberrations]
+    if threshold is None:
+        threshold = float(np.percentile(samples[-1].image_mask, percentile))
+    visible = [s.image_mask[s.image_mask > threshold] for s in samples]
+    occupied = [v for v in visible if v.size]
+    norm = (plt.Normalize(min(v.min() for v in occupied),
+                          max(v.max() for v in occupied))
+            if occupied else plt.Normalize(0, 1))
+    del visible, occupied
+
+    def snapshot(fig, title):
+        try:
+            fig.set_dpi(dpi)
+            fig.suptitle(title, fontsize=9)
+            canvas = FigureCanvasAgg(fig)
+            canvas.draw()
+            return np.asarray(canvas.buffer_rgba())[..., :3].copy()
+        finally:
+            plt.close(fig)
+
+    phase_frames, object_frames = [], []
+    with plt.ioff():
+        for entry, aberration, sample in zip(entries, aberrations, samples):
+            title = f"Iteration {entry['iteration']}\nLoss = {entry['loss']:.3e}"
+            fig, _ = zernike_plot(aberration.construct_map(microscope.alpha),
+                                  microscope.alpha, res=res, show=False)
+            phase_frames.append(snapshot(fig, title))
+            fig, _ = plot_sample_3D(sample, threshold=threshold, norm=norm, show=False)
+            object_frames.append(snapshot(fig, title))
+
+        def make_animation(frames):
+            height, width = frames[0].shape[:2]
+            fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
+            ax = fig.add_axes([0, 0, 1, 1])
+            ax.set_axis_off()
+            artist = ax.imshow(frames[0])
+
+            def update(index):
+                artist.set_data(frames[index])
+                return (artist,)
+
+            animation = FuncAnimation(fig, update, frames=len(frames),
+                                      interval=interval, blit=False, repeat=True)
+            plt.close(fig)
+            return animation
+
+        return make_animation(phase_frames), make_animation(object_frames)
+
+
 """
 Plots every plane of an image stack with a shared intensity scale and colorbar.
 Params:
@@ -70,13 +176,16 @@ Params:
     alpha (float): voxel face and edge opacity between zero and one (default 0.3)
     file_name (str | None): optional PNG filename in the project figures directory
     cmap (str): colormap mapping visible sample values to voxel colors
+    show (bool): display immediately; False allows animation rendering
+    norm: optional shared Matplotlib color normalization
 Returns:
     fig (Figure): figure containing the plot
     ax (Axes): three-dimensional axes
 """
 def plot_sample_3D(sample: Image_Mask_3D, threshold: float = 0.0,
                    marker_size: float = 8.0, alpha: float = 0.3,
-                   file_name: str | None = None, cmap: str = "Greys_r"):
+                   file_name: str | None = None, cmap: str = "Greys_r",
+                   *, show: bool = True, norm=None):
     values = sample.image_mask
     if not np.all(np.isfinite(values)):
         raise ValueError("Sample must contain only finite values.")
@@ -101,7 +210,7 @@ def plot_sample_3D(sample: Image_Mask_3D, threshold: float = 0.0,
     ax = fig.add_subplot(111, projection="3d")
     if np.any(visible):
         colors = plt.cm.ScalarMappable(
-            norm=plt.Normalize(values[visible].min(), values[visible].max()),
+            norm=norm if norm is not None else plt.Normalize(values[visible].min(), values[visible].max()),
             cmap=cmap)
         ax.voxels(xe[:, None, None], ye[None, :, None], ze[None, None, :],
                   visible, facecolors=colors.to_rgba(values.ravel(), alpha=alpha).reshape(values.shape + (4,)),
@@ -117,7 +226,8 @@ def plot_sample_3D(sample: Image_Mask_3D, threshold: float = 0.0,
     ax.set_proj_type("ortho")
     if file_name is not None:
         fig.savefig(_figure_path(file_name), bbox_inches="tight")
-    plt.show()
+    if show:
+        plt.show()
     return fig, ax
 
 
@@ -352,7 +462,8 @@ Returns:
     fig (Figure): figure containing the plot
     ax (Axes): polar phase-map axes
 """
-def zernike_plot(z_map: Callable[[np.ndarray, np.ndarray], np.ndarray], alpha: float, file_name: str | None=None, res: int=500):
+def zernike_plot(z_map: Callable[[np.ndarray, np.ndarray], np.ndarray], alpha: float, file_name: str | None=None, res: int=500,
+                 *, show: bool = True):
     fig = plt.figure(figsize=(2, 3), dpi=600)
 
     rho = np.linspace(0, 1, res)
@@ -386,7 +497,8 @@ def zernike_plot(z_map: Callable[[np.ndarray, np.ndarray], np.ndarray], alpha: f
 
     if file_name is not None:
         plt.savefig(_figure_path(file_name), bbox_inches="tight")
-    plt.show()
+    if show:
+        plt.show()
     return fig, polar_ax
 
 
