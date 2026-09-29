@@ -7,16 +7,67 @@ execution and speedups still need validation on a GPU node.
 
 ## Installation and validation
 
-Use a Linux GPU environment with NumPy, SciPy and a CuPy wheel matching the
-cluster's CUDA installation. For a CUDA 12 environment:
+The repository-root `environment.yml` describes the local Python 3.11 project
+requirements, plus JupyterLab for running notebooks. It uses portable dependency
+constraints rather than macOS build identifiers or a machine-specific prefix;
+it is not an exact lock of the local environment.
+
+After these files have been committed/pushed and pulled on the cluster, run from
+the repository root using your site's Conda installation:
 
 ```sh
-python -m pip install numpy scipy cupy-cuda12x
-REQUIRE_CUDA=1 python -m unittest discover -s tests -p 'test_reconstruction_cuda.py' -v
+conda env create -f environment.yml
+conda activate phase_diversity_env
+conda install --override-channels -c conda-forge cupy
 ```
 
-Choose the wheel using the [official CuPy installation guide](https://docs.cupy.dev/en/stable/install.html)
-and your cluster's driver/toolkit configuration. Install only one CuPy package.
+The last command adds the GPU backend. Conda-forge's `cupy` package installs
+CUDA runtime dependencies; a separate system CUDA toolkit is normally unnecessary.
+The cluster must provide a compatible NVIDIA driver. Prefer installing CuPy from
+an allocated GPU node, where Conda can detect driver compatibility. If packages
+must be installed on a login node, use your site's supported CUDA version
+explicitly, e.g. `conda install --override-channels -c conda-forge cupy cuda-version=12.9`
+**only if that version is supported by the GPU nodes**. See the
+[official CuPy installation guide](https://docs.cupy.dev/en/stable/install.html).
+Do not also pip-install a CuPy wheel into this environment.
+
+Within an allocated GPU job, verify the environment:
+
+```sh
+conda activate phase_diversity_env
+nvidia-smi
+python -c "import cupy as cp; cp.show_config(); print('GPUs:', cp.cuda.runtime.getDeviceCount())"
+REQUIRE_CUDA=1 python -m unittest discover -s tests -v
+```
+
+For notebook use, register and select the remote kernel:
+
+```sh
+python -m ipykernel install --user --name phase_diversity_env --display-name "Phase diversity (cluster)"
+```
+
+Activate the environment in every batch job too. If `conda activate` is not
+initialized in noninteractive shells, use your site's Conda module/setup, then:
+
+```sh
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate phase_diversity_env
+```
+
+Once validated on the cluster, record the exact solved packages for repeat runs
+on the same OS/architecture:
+
+```sh
+conda list --explicit > conda-cluster-explicit.txt
+# Later, on a compatible cluster machine:
+conda create -n phase_diversity_replay --file conda-cluster-explicit.txt
+```
+
+The portable YAML intentionally omits CUDA so it can also recreate the CPU and
+notebook environment on macOS. CuPy is added on the cluster; the explicit cluster
+snapshot includes it. Environment creation and CUDA execution have not been
+validated on a cluster yet.
+
 The ordinary test suite skips CUDA tests without a GPU; `REQUIRE_CUDA=1` makes
 missing CUDA an error. The tests exercise the same workspace with NumPy and
 CuPy and compare against the independent CPU solver, including finite differences.
