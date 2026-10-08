@@ -4,9 +4,33 @@ __pycache__/
 .ipynb_checkpoints/
 *.aux
 *.log
+# Generated figures and animations (PDF documents remain eligible).
+figures/
 *.png
 *.gif
 *.jpg
+*.jpeg
+*.svg
+*.eps
+*.bmp
+*.webp
+*.tif
+*.tiff
+*.mp4
+*.mov
+*.webm
+
+# Acquisition data and exported numerical results.
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.mat
+*.csv
+*.tsv
+optimization/performance/*.json
+
+# LaTeX build intermediates (keep .tex sources and .pdf documents).
 *.out
 *.fls
 *.fdb_latexmk

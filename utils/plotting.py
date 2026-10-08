@@ -8,11 +8,15 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from utils.psf import Image_Mask_3D
 
+# Plotting functions accept ax=None to create axes, or existing axes to draw on.
+# Stack/multi-panel functions accept an array of axes; 3D and phase plots need
+# axes with projection="3d" and projection="polar", respectively.
+
 
 def animate_reconstruction(info: dict, modes, microscope, *,
                            interval: float = 500, threshold: float | None = None,
                            percentile: float = 98, stride: int = 1,
-                           res: int = 150, dpi: int = 100,
+                           res: int = 150, dpi: int = 100, ax=None,
                            **reconstruction_kwargs):
     """Animate recorded optimizer iterates using zernike_plot and plot_sample_3D.
 
@@ -22,6 +26,7 @@ def animate_reconstruction(info: dict, modes, microscope, *,
     as reconstruction_kwargs. Objects are refitted once per selected iterate;
     rendering and replay do not rerun reconstruction. No optimization is run.
 
+    ax optionally supplies two playback axes (phase, object).
     Returns (aberration_animation, object_animation), two FuncAnimations.
     In notebooks use display(HTML(animation.to_jshtml())). Keep references
     to both animations; save with animation.save("name.gif", writer="pillow").
@@ -96,10 +101,14 @@ def animate_reconstruction(info: dict, modes, microscope, *,
             fig, _ = plot_sample_3D(sample, threshold=threshold, norm=norm, show=False)
             object_frames.append(snapshot(fig, title))
 
-        def make_animation(frames):
+        def make_animation(frames, ax=None):
             height, width = frames[0].shape[:2]
-            fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
-            ax = fig.add_axes([0, 0, 1, 1])
+            supplied_ax = ax is not None
+            if ax is None:
+                fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
+                ax = fig.add_axes([0, 0, 1, 1])
+            else:
+                fig = ax.figure
             ax.set_axis_off()
             artist = ax.imshow(frames[0])
 
@@ -109,10 +118,15 @@ def animate_reconstruction(info: dict, modes, microscope, *,
 
             animation = FuncAnimation(fig, update, frames=len(frames),
                                       interval=interval, blit=False, repeat=True)
-            plt.close(fig)
+            if not supplied_ax:
+                plt.close(fig)
             return animation
 
-        return make_animation(phase_frames), make_animation(object_frames)
+        animation_axes = [None, None] if ax is None else np.asarray(ax, dtype=object).ravel()
+        if len(animation_axes) != 2:
+            raise ValueError("ax must contain two axes for the phase and object animations.")
+        return (make_animation(phase_frames, animation_axes[0]),
+                make_animation(object_frames, animation_axes[1]))
 
 
 """
@@ -131,7 +145,7 @@ Returns:
 """
 def plot_image_stack(x: np.ndarray, y: np.ndarray, z: np.ndarray,
                      images: np.ndarray, ncols: int = 4,
-                     normalize: bool = True, file_name: str | None = None):
+                     normalize: bool = True, file_name: str | None = None, *, ax=None):
     x, y, z = (np.asarray(axis) for axis in (x, y, z))
     images = np.asarray(images)
     if any(axis.ndim != 1 for axis in (x, y, z)) or len(x) < 2 or len(y) < 2 or len(z) == 0:
@@ -145,9 +159,19 @@ def plot_image_stack(x: np.ndarray, y: np.ndarray, z: np.ndarray,
     values = _normalize_intensity(images) if normalize else images
     columns = min(ncols, len(z))
     rows = (len(z) + columns - 1) // columns
-    fig, panels = plt.subplots(rows, columns, squeeze=False, sharex=True, sharey=True,
-                               figsize=(3 * columns, 3 * rows), layout="constrained")
-    axs = panels.ravel()[:len(z)]
+    if ax is None:
+        fig, panels = plt.subplots(rows, columns, squeeze=False, sharex=True, sharey=True,
+                                   figsize=(3 * columns, 3 * rows), layout="constrained")
+        axs = panels.ravel()[:len(z)]
+        for unused_ax in panels.ravel()[len(z):]:
+            fig.delaxes(unused_ax)
+    else:
+        axs = np.asarray(ax, dtype=object).ravel()
+        if len(axs) != len(z):
+            raise ValueError("ax must contain one axes per image plane.")
+        fig = axs[0].figure
+        if any(panel.figure is not fig for panel in axs):
+            raise ValueError("All axes must belong to the same figure.")
     for ax, level, plane in zip(axs, z, values):
         artist = ax.imshow(plane.T, extent=_image_extent(x, y), origin="lower",
                            aspect="equal", cmap="Greys_r",
@@ -156,8 +180,6 @@ def plot_image_stack(x: np.ndarray, y: np.ndarray, z: np.ndarray,
         ax.set_xlabel("x [mm]")
         ax.set_ylabel("y [mm]")
         ax.grid(False)
-    for ax in panels.ravel()[len(z):]:
-        fig.delaxes(ax)
     label = "Intensity (stack normalized)" if normalize else "Intensity (raw)"
     fig.colorbar(artist, ax=list(axs), label=label, shrink=0.8)
     if file_name is not None:
@@ -185,7 +207,7 @@ Returns:
 def plot_sample_3D(sample: Image_Mask_3D, threshold: float = 0.0,
                    marker_size: float = 8.0, alpha: float = 0.3,
                    file_name: str | None = None, cmap: str = "Greys_r",
-                   *, show: bool = True, norm=None):
+                   *, show: bool = True, norm=None, ax: Axes | None = None):
     values = sample.image_mask
     if not np.all(np.isfinite(values)):
         raise ValueError("Sample must contain only finite values.")
@@ -206,8 +228,13 @@ def plot_sample_3D(sample: Image_Mask_3D, threshold: float = 0.0,
     dy = abs(y[1] - y[0])
     xe, ye, ze = edges(x, dx), edges(y, dy), edges(z, min(dx, dy))
     visible = values > threshold
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection="3d")
+    if ax is None:
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection="3d")
+    else:
+        if ax.name != "3d":
+            raise ValueError("ax must be a 3D axes.")
+        fig = ax.figure
     if np.any(visible):
         colors = plt.cm.ScalarMappable(
             norm=norm if norm is not None else plt.Normalize(values[visible].min(), values[visible].max()),
@@ -285,15 +312,18 @@ Returns:
     fig (Figure): figure containing the plot
     ax (Axes): main plot axes
 """
-def plot_intensity(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, file_name: str | None=None, normalize: bool=True, vmax: float | bool=False):
-    fig, ax = plt.subplots(figsize=(3.5, 3.5), dpi=300)
+def plot_intensity(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, file_name: str | None=None, normalize: bool=True, vmax: float | bool=False, *, ax: Axes | None = None):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(3.5, 3.5), dpi=300)
+    else:
+        fig = ax.figure
 
     if normalize:
         intensity_map = _normalize_intensity(intensity_map)
     if not vmax:
         vmax = np.max(intensity_map)
 
-    plt.imshow(
+    artist = ax.imshow(
         intensity_map.T,
         extent=_image_extent(x, y),
         origin="lower",
@@ -308,19 +338,21 @@ def plot_intensity(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, file
     y_step = (np.max(y) - np.min(y)) / 5
     x_ticks = np.arange(np.min(x), np.max(x) + x_step, x_step)
     y_ticks = np.arange(np.min(y), np.max(y) + y_step, y_step)
-    plt.xticks(x_ticks, rotation=45)
-    plt.yticks(y_ticks, rotation=45)
+    ax.set_xticks(x_ticks)
+    ax.tick_params(axis="x", labelrotation=45)
+    ax.set_yticks(y_ticks)
+    ax.tick_params(axis="y", labelrotation=45)
 
     ax.set_xlabel("x [mm]")
     ax.set_ylabel("y [mm]")
     if normalize:
-        plt.colorbar(label="Intensity (Normalized)")
+        fig.colorbar(artist, ax=ax, label="Intensity (Normalized)")
     else:
-        plt.colorbar(label="Intensity (Raw)")
+        fig.colorbar(artist, ax=ax, label="Intensity (Raw)")
 
-    plt.gca().set_aspect("equal")
+    ax.set_aspect("equal")
     if file_name is not None:
-        plt.savefig(_figure_path(file_name), bbox_inches="tight")
+        fig.savefig(_figure_path(file_name), bbox_inches="tight")
     plt.show()
     return fig, ax
 
@@ -338,15 +370,18 @@ Returns:
     fig (Figure): figure containing the plot
     ax (Axes): main plot axes
 """
-def plot_intensity_clean(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, file_name: str | None=None, normalize: bool=True, vmax: float | bool=False):
-    fig, ax = plt.subplots(figsize=(3.5, 3.5), dpi=300)
+def plot_intensity_clean(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, file_name: str | None=None, normalize: bool=True, vmax: float | bool=False, *, ax: Axes | None = None):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(3.5, 3.5), dpi=300)
+    else:
+        fig = ax.figure
 
     if normalize:
         intensity_map = _normalize_intensity(intensity_map)
     if not vmax:
         vmax = np.max(intensity_map)
 
-    plt.imshow(
+    artist = ax.imshow(
         intensity_map.T,
         extent=_image_extent(x, y),
         origin="lower",
@@ -356,12 +391,12 @@ def plot_intensity_clean(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray
         cmap="Greys_r",
     )
     ax.grid(False)
-    plt.xticks([])
-    plt.yticks([])
-    plt.gca().set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect("equal")
 
     if file_name is not None:
-        plt.savefig(_figure_path(file_name), bbox_inches="tight")
+        fig.savefig(_figure_path(file_name), bbox_inches="tight")
     plt.show()
     return fig, ax
 
@@ -377,10 +412,13 @@ Returns:
     fig (Figure): figure containing the plot
     ax (Axes): main plot axes
 """
-def plot_intensity_unnorm(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, file_name: str | None=None):
-    fig, ax = plt.subplots(figsize=(3.5, 3.5), dpi=300)
+def plot_intensity_unnorm(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, file_name: str | None=None, *, ax: Axes | None = None):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(3.5, 3.5), dpi=300)
+    else:
+        fig = ax.figure
 
-    plt.imshow(
+    artist = ax.imshow(
         intensity_map.T,
         extent=_image_extent(x, y),
         origin="lower",
@@ -393,16 +431,18 @@ def plot_intensity_unnorm(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarra
     y_step = (np.max(y) - np.min(y)) / 5
     x_ticks = np.arange(np.min(x), np.max(x) + x_step, x_step)
     y_ticks = np.arange(np.min(y), np.max(y) + y_step, y_step)
-    plt.xticks(x_ticks, rotation=45)
-    plt.yticks(y_ticks, rotation=45)
+    ax.set_xticks(x_ticks)
+    ax.tick_params(axis="x", labelrotation=45)
+    ax.set_yticks(y_ticks)
+    ax.tick_params(axis="y", labelrotation=45)
 
     ax.set_xlabel("x [mm]")
     ax.set_ylabel("y [mm]")
-    plt.colorbar(label="Intensity (Unnormalized)")
-    plt.gca().set_aspect("equal")
+    fig.colorbar(artist, ax=ax, label="Intensity (Unnormalized)")
+    ax.set_aspect("equal")
 
     if file_name is not None:
-        plt.savefig(_figure_path(file_name), bbox_inches="tight")
+        fig.savefig(_figure_path(file_name), bbox_inches="tight")
     plt.show()
     return fig, ax
 
@@ -420,8 +460,8 @@ Returns:
     fig (Figure): figure containing the plot
     axs (np.ndarray): array of panel axes
 """
-def plot_many_intensity(axs: Sequence[Axes] | np.ndarray, x: np.ndarray, y: np.ndarray, intensity_maps: Sequence[np.ndarray], is_edge: bool=False, is_horizontal: bool=True):
-    axs = np.ravel(axs)
+def plot_many_intensity(axs: Sequence[Axes] | np.ndarray, x: np.ndarray, y: np.ndarray, intensity_maps: Sequence[np.ndarray], is_edge: bool=False, is_horizontal: bool=True, *, ax=None):
+    axs = np.ravel(axs if ax is None else ax)
     for i, ax in enumerate(axs):
         if is_horizontal:
             if is_edge:
@@ -463,8 +503,26 @@ Returns:
     ax (Axes): polar phase-map axes
 """
 def zernike_plot(z_map: Callable[[np.ndarray, np.ndarray], np.ndarray], alpha: float, file_name: str | None=None, res: int=500,
-                 *, show: bool = True):
-    fig = plt.figure(figsize=(2, 3), dpi=600)
+                 *, show: bool = True, ax: Axes | None = None, colorbar: bool = True):
+    """Plot on existing axes, replacing nonpolar axes in their layout slot.
+
+    Returns the polar axes; assign it back to your axes array if reusing it.
+    Use show=False when filling multiple subplots, then call plt.show().
+    Set colorbar=False to omit the phase colorbar.
+    """
+    if ax is None:
+        fig = plt.figure(figsize=(2, 3), dpi=600)
+        ax = fig.add_axes([0.1, 0.25, 0.8, 0.7], projection="polar")
+    else:
+        fig = ax.figure
+        if ax.name != "polar":
+            subplot_spec = ax.get_subplotspec()
+            position = ax.get_position().bounds
+            ax.remove()
+            if subplot_spec is not None:
+                ax = fig.add_subplot(subplot_spec, projection="polar")
+            else:
+                ax = fig.add_axes(position, projection="polar")
 
     rho = np.linspace(0, 1, res)
     phi = np.linspace(0, 2 * np.pi, res)
@@ -472,7 +530,7 @@ def zernike_plot(z_map: Callable[[np.ndarray, np.ndarray], np.ndarray], alpha: f
     theta_grid = np.arcsin(rho_grid * np.sin(alpha))
     z = z_map(theta_grid, phi_grid)
 
-    polar_ax = fig.add_axes([0.1, 0.25, 0.8, 0.7], projection="polar")
+    polar_ax = ax
     pcm = polar_ax.pcolormesh(
         phi,
         rho,
@@ -486,17 +544,18 @@ def zernike_plot(z_map: Callable[[np.ndarray, np.ndarray], np.ndarray], alpha: f
     polar_ax.set_xticklabels([])
     polar_ax.set_yticklabels([])
 
-    cbar = fig.colorbar(
-        pcm,
-        ax=polar_ax,
-        orientation="horizontal",
-        pad=0.15,
-        fraction=0.08,
-    )
-    cbar.set_label("Phase (rad)")
+    if colorbar:
+        cbar = fig.colorbar(
+            pcm,
+            ax=polar_ax,
+            orientation="horizontal",
+            pad=0.15,
+            fraction=0.08,
+        )
+        cbar.set_label("Phase (rad)")
 
     if file_name is not None:
-        plt.savefig(_figure_path(file_name), bbox_inches="tight")
+        fig.savefig(_figure_path(file_name), bbox_inches="tight")
     if show:
         plt.show()
     return fig, polar_ax
@@ -515,10 +574,13 @@ Returns:
     fig (Figure): figure containing the plot
     ax (Axes): main plot axes
 """
-def composite_plot(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, z_map: Callable[[np.ndarray, np.ndarray], np.ndarray], alpha: float, file_name: str | None=None):
-    fig, ax = plt.subplots(dpi=300)
+def composite_plot(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, z_map: Callable[[np.ndarray, np.ndarray], np.ndarray], alpha: float, file_name: str | None=None, *, ax: Axes | None = None):
+    if ax is None:
+        fig, ax = plt.subplots(dpi=300)
+    else:
+        fig = ax.figure
 
-    plt.imshow(
+    artist = ax.imshow(
         _normalize_intensity(intensity_map).T,
         extent=_image_extent(x, y),
         origin="lower",
@@ -526,8 +588,8 @@ def composite_plot(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, z_ma
         cmap="Greys_r",
     )
     ax.grid(False)
-    plt.xticks(rotation=45)
-    plt.yticks(rotation=45)
+    ax.tick_params(axis="x", labelrotation=45)
+    ax.tick_params(axis="y", labelrotation=45)
     ax.set_xlabel("x [mm]")
     ax.set_ylabel("y [mm]")
 
@@ -537,16 +599,7 @@ def composite_plot(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, z_ma
     theta_grid = np.arcsin(rho_grid * np.sin(alpha))
     z = z_map(theta_grid, phi_grid)
 
-    size_param = 0.05
-    polar_ax = fig.add_axes(
-        [
-            0.58 - size_param,
-            0.68 - size_param,
-            0.2 + size_param,
-            0.2 + size_param,
-        ],
-        projection="polar",
-    )
+    polar_ax = ax.inset_axes([0.65, 0.65, 0.3, 0.3], projection="polar")
     polar_ax.pcolormesh(
         phi,
         rho,
@@ -560,9 +613,9 @@ def composite_plot(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, z_ma
     polar_ax.set_xticklabels([])
     polar_ax.set_yticklabels([])
 
-    plt.colorbar(label="Intensity (Normalized)")
+    fig.colorbar(artist, ax=ax, label="Intensity (Normalized)")
     if file_name is not None:
-        plt.savefig(_figure_path(file_name), bbox_inches="tight")
+        fig.savefig(_figure_path(file_name), bbox_inches="tight")
     plt.show()
     return fig, ax
 
@@ -580,10 +633,13 @@ Returns:
     fig (Figure): figure containing the plot
     ax (Axes): main plot axes
 """
-def composite_plot_clean(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, z_map: Callable[[np.ndarray, np.ndarray], np.ndarray], alpha: float, file_name: str | None=None):
-    fig, ax = plt.subplots(dpi=300)
+def composite_plot_clean(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray, z_map: Callable[[np.ndarray, np.ndarray], np.ndarray], alpha: float, file_name: str | None=None, *, ax: Axes | None = None):
+    if ax is None:
+        fig, ax = plt.subplots(dpi=300)
+    else:
+        fig = ax.figure
 
-    plt.imshow(
+    artist = ax.imshow(
         _normalize_intensity(intensity_map).T,
         extent=_image_extent(x, y),
         origin="lower",
@@ -591,8 +647,8 @@ def composite_plot_clean(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray
         cmap="Greys_r",
     )
     ax.grid(False)
-    plt.xticks([])
-    plt.yticks([])
+    ax.set_xticks([])
+    ax.set_yticks([])
 
     rho = np.linspace(0, 1, 500)
     phi = np.linspace(0, 2 * np.pi, 500)
@@ -600,16 +656,7 @@ def composite_plot_clean(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray
     theta_grid = np.arcsin(rho_grid * np.sin(alpha))
     z = z_map(theta_grid, phi_grid)
 
-    size_param = 0.05
-    polar_ax = fig.add_axes(
-        [
-            0.58 - size_param,
-            0.68 - size_param,
-            0.2 + size_param,
-            0.2 + size_param,
-        ],
-        projection="polar",
-    )
+    polar_ax = ax.inset_axes([0.65, 0.65, 0.3, 0.3], projection="polar")
     polar_ax.pcolormesh(
         phi,
         rho,
@@ -624,7 +671,7 @@ def composite_plot_clean(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarray
     polar_ax.set_yticklabels([])
 
     if file_name is not None:
-        plt.savefig(_figure_path(file_name), bbox_inches="tight")
+        fig.savefig(_figure_path(file_name), bbox_inches="tight")
     plt.show()
     return fig, ax
 
@@ -659,8 +706,10 @@ def many_composite(
     vmax: float | bool=2 * np.pi,
     is_edge: bool=False,
     is_horizontal: bool=True,
+    *, ax=None,
 ):
-    axs = np.ravel(axs)
+    axs = np.ravel(axs if ax is None else ax)
+    fig = axs[0].figure
     intensity_vmax = max(np.max(i_map) for i_map in intensity_maps)
 
     for i, ax in enumerate(axs):

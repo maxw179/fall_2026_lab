@@ -1,10 +1,29 @@
 import unittest
 from unittest.mock import patch
 import numpy as np
-from optimization.reconstruction import estimate_sample_3D, evaluate_loss_3D
+from optimization.reconstruction import (CPUReconstructionWorkspace,
+                                         estimate_sample_3D, evaluate_loss_3D)
 from utils.psf import (Microscope, Arbitrary_Grid, Image_Mask, Image_Mask_3D,
                        _convolution_grid, _grid_at_z)
 from utils.zernike import Aberration
+
+
+def fixed_kernel_otfs(kernel):
+    """Supply a known convolution kernel without invoking optical propagation."""
+    def build(workspace, strengths, first=False, include_base=True):
+        if first:
+            raise AssertionError("Synthetic kernel fixture has no phase derivatives.")
+        otf = workspace._transform(kernel)
+        shape = (len(workspace.focal_z), len(workspace.sample_z), len(workspace.weights))
+        return np.broadcast_to(otf, shape).copy(), None, None
+    return build
+
+
+def synthetic_workspace():
+    """Use the real Newton control flow with an independent analytic loss."""
+    workspace = CPUReconstructionWorkspace.__new__(CPUReconstructionWorkspace)
+    workspace.modes = np.array([[0, 4]])
+    return workspace
 
 
 class ReconstructionTests(unittest.TestCase):
@@ -28,7 +47,7 @@ class ReconstructionTests(unittest.TestCase):
         fitted = np.linalg.solve(A.T@A+rho*np.eye(A.shape[1]),A.T@padded)
         expected = fitted.reshape(shape)[2:6,3:8]
         expected_loss = np.prod(shape) * (np.sum((A@fitted-padded)**2) + rho*np.sum(fitted**2))
-        with patch.object(m,'compute_PSF',return_value=(None,None,kernel)):
+        with patch.object(CPUReconstructionWorkspace, '_build_otfs', fixed_kernel_otfs(kernel)):
             sample, info = estimate_sample_3D(m,g,data,[0],[0],a,rho,padding=padding,return_info=True)
             loss = evaluate_loss_3D(m,g,data,[0],[0],a,rho,padding=padding)
         self.assertAlmostEqual(loss, expected_loss, places=9)
@@ -44,7 +63,7 @@ class ReconstructionTests(unittest.TestCase):
             g = Arbitrary_Grid(.004,.006,nx,ny,.02,-.03,0)
             kernel = np.zeros((5,5));kernel[2,2] = 1
             data = np.zeros((1,nx,ny));data[0,-1,0] = 1
-            with patch.object(m,'compute_PSF',return_value=(None,None,kernel)):
+            with patch.object(CPUReconstructionWorkspace, '_build_otfs', fixed_kernel_otfs(kernel)):
                 for padding in [None,0,1,(2,3)]:
                     sample = estimate_sample_3D(m,g,data,[0],[0],a,.01,padding=padding)
                     np.testing.assert_allclose(sample.image_mask,data/1.01,atol=1e-14)
@@ -183,8 +202,12 @@ class AberrationOptimizationTests(unittest.TestCase):
             def loss(**kwargs):
                 return derivatives(**kwargs)[0]
 
-            with patch('optimization.reconstruction.evaluate_loss_derivatives_3D', side_effect=derivatives), \
-                 patch('optimization.reconstruction.evaluate_loss_3D', side_effect=loss):
+            workspace = synthetic_workspace()
+            with patch('optimization.reconstruction._workspace', return_value=workspace), \
+                 patch.object(workspace, 'derivatives', side_effect=lambda s:
+                     derivatives(aberration=Aberration([[0, 4]], s))), \
+                 patch.object(workspace, 'loss', side_effect=lambda s:
+                     loss(aberration=Aberration([[0, 4]], s))):
                 result, info = optimize_aberration_3D(
                     None, None, None, [0], [0], [[0, 4]], 1,
                     gradient_tolerance=1e-9, verbose=False)
@@ -216,8 +239,12 @@ class AberrationOptimizationTests(unittest.TestCase):
         def derivatives(*, aberration, **kwargs):
             x = aberration.strengths[0]
             return 1+(x-1)**2, np.array([2*(x-1)]), np.array([[2.]])
-        with patch('optimization.reconstruction.evaluate_loss_derivatives_3D', side_effect=derivatives), \
-             patch('optimization.reconstruction.evaluate_loss_3D', side_effect=lambda **kw: derivatives(**kw)[0]):
+        workspace = synthetic_workspace()
+        with patch('optimization.reconstruction._workspace', return_value=workspace), \
+             patch.object(workspace, 'derivatives', side_effect=lambda s:
+                 derivatives(aberration=Aberration([[0, 4]], s))), \
+             patch.object(workspace, 'loss', side_effect=lambda s:
+                 derivatives(aberration=Aberration([[0, 4]], s))[0]):
             result, info = optimize_aberration_3D(None, None, None, [0], [0], [[0, 4]],
                                                 1, max_iterations=1, verbose=False)
         self.assertFalse(info['success'])
