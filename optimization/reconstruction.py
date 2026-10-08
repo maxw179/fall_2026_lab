@@ -1,8 +1,10 @@
-"""Regularized 3D reconstruction and exact-Hessian CPU aberration optimization.
+"""Regularized 3D reconstruction and aberration optimization on CPU or NVIDIA GPU.
 
 The public functions keep their existing arguments and return values. A persistent
-NumPy workspace reuses fixed geometry and accepted fits during optimization.
-Use CPUReconstructionWorkspace directly to reuse an acquisition across calls.
+array workspace reuses fixed geometry and accepted fits during optimization.
+The default backend="auto" selects CUDA when CuPy and an NVIDIA GPU work,
+otherwise CPU. Pass backend="cpu" or backend="cuda" to choose explicitly.
+Use ReconstructionWorkspace to reuse an acquisition across calls.
 """
 
 from __future__ import annotations
@@ -15,13 +17,35 @@ from optimization._reconstruction_common import (
     _KernelTransform, _derivative_geometry, _fourier_loss, _frequency_weights)
 from optimization._reconstruction_cpu import CPUReconstructionWorkspace
 
-ReconstructionWorkspace = CPUReconstructionWorkspace
+def get_backend(backend="auto"):
+    """Resolve auto/cpu/cuda; auto uses CUDA only with a working CuPy device."""
+    if backend not in ('auto', 'cpu', 'cuda'):
+        raise ValueError("backend must be 'auto', 'cpu', or 'cuda'.")
+    if backend == 'cpu':
+        return 'cpu'
+    from optimization.reconstruction_cuda import _cupy
+    try:
+        _cupy()
+    except (ImportError, RuntimeError):
+        if backend == 'cuda':
+            raise
+        return 'cpu'
+    return 'cuda'
+
+
+def ReconstructionWorkspace(*args, backend="auto", **kwargs):
+    """Create a persistent workspace on the automatically selected backend."""
+    if get_backend(backend) == 'cuda':
+        from optimization.reconstruction_cuda import CUDAReconstruction
+        return CUDAReconstruction(*args, **kwargs)
+    return CPUReconstructionWorkspace(*args, **kwargs)
 
 
 def _workspace(microscope, grid, images, focal_z_levels, sample_z_levels,
                modes, rho, diversities, mode, frequency_batch_size, padding,
-               *, reuse_svd=True):
-    return CPUReconstructionWorkspace(
+               *, reuse_svd=True, backend="auto", psf_batch_size=8):
+    return ReconstructionWorkspace(
+        backend=backend, psf_batch_size=psf_batch_size,
         microscope=microscope, grid=grid, images=images,
         focal_z_levels=focal_z_levels, sample_z_levels=sample_z_levels,
         modes=modes, rho=rho, diversities=diversities, mode=mode,
@@ -38,7 +62,8 @@ def estimate_sample_3D(microscope: Microscope, grid: Arbitrary_Grid,
                        mode: Literal['scalar', 'vector'] = 'vector',
                        frequency_batch_size: int = 4096,
                        padding: int | tuple[int, int] | None = None,
-                       return_info: bool = False):
+                       return_info: bool = False, *,
+                       backend: str = "auto", psf_batch_size: int = 8):
     """
     Estimates a 3D sample using the regularized Gaussian object estimator in math.tex.
     Zero-pads the acquired stack, applies the frequency-wise regularized SVD solve,
@@ -62,6 +87,8 @@ def estimate_sample_3D(microscope: Microscope, grid: Arbitrary_Grid,
         frequency_batch_size (int): maximum spatial frequencies solved together
         padding (int | tuple[int, int] | None): pixels added to each side of x and y;
             None uses half the PSF size on each axis; zero gives the unpadded solver
+        backend (str): auto (default), cpu, or cuda; CUDA requires working CuPy
+        psf_batch_size (int): maximum unique PSFs propagated together
         return_info (bool): whether to also return padded-domain fit diagnostics
     Returns:
         sample (Image_Mask_3D): real-valued estimate at the requested P planes
@@ -71,7 +98,8 @@ def estimate_sample_3D(microscope: Microscope, grid: Arbitrary_Grid,
     """
     workspace = _workspace(microscope, grid, images, focal_z_levels,
                            sample_z_levels, aberration.modes, rho, diversities,
-                           mode, frequency_batch_size, padding, reuse_svd=False)
+                           mode, frequency_batch_size, padding, reuse_svd=False,
+                           backend=backend, psf_batch_size=psf_batch_size)
     return workspace.estimate_sample(aberration.strengths, return_info=return_info)
 
 
@@ -83,10 +111,11 @@ def evaluate_loss_3D(microscope: Microscope, grid: Arbitrary_Grid,
                      diversities: Sequence[Aberration] | None = None,
                      mode: Literal['scalar', 'vector'] = 'vector',
                      frequency_batch_size: int = 4096,
-                     padding: int | tuple[int, int] | None = None) -> float:
+                     padding: int | tuple[int, int] | None = None, *,
+                     backend: str = "auto", psf_batch_size: int = 8) -> float:
     """Evaluate the regularized Gaussian loss at a given aberration.
 
-    Uses the batched CPU workspace to fit the sample and returns
+    Uses the batched selected-backend workspace to fit the sample and returns
     sum(|D - S F_hat|**2) + rho * sum(|F_hat|**2), as in math.tex.
     Sums cover the full lateral Fourier grid using NumPy's unnormalized
     forward FFT convention. By Parseval's identity this is the spatial
@@ -98,7 +127,8 @@ def evaluate_loss_3D(microscope: Microscope, grid: Arbitrary_Grid,
     """
     workspace = _workspace(microscope, grid, images, focal_z_levels,
                            sample_z_levels, aberration.modes, rho, diversities,
-                           mode, frequency_batch_size, padding, reuse_svd=False)
+                           mode, frequency_batch_size, padding, reuse_svd=False,
+                           backend=backend, psf_batch_size=psf_batch_size)
     return workspace.loss(aberration.strengths)
 
 
@@ -110,7 +140,8 @@ def evaluate_loss_derivatives_3D(microscope: Microscope, grid: Arbitrary_Grid,
                                  diversities: Sequence[Aberration] | None = None,
                                  mode: Literal['scalar', 'vector'] = 'vector',
                                  frequency_batch_size: int = 4096,
-                                 padding: int | tuple[int, int] | None = None
+                                 padding: int | tuple[int, int] | None = None, *,
+                                 backend: str = "auto", psf_batch_size: int = 8
                                  ) -> tuple[float, np.ndarray, np.ndarray]:
     """Return (loss, gradient, Hessian) of the fitted-sample Gaussian loss.
 
@@ -128,7 +159,8 @@ def evaluate_loss_derivatives_3D(microscope: Microscope, grid: Arbitrary_Grid,
     """
     workspace = _workspace(microscope, grid, images, focal_z_levels,
                            sample_z_levels, aberration.modes, rho, diversities,
-                           mode, frequency_batch_size, padding)
+                           mode, frequency_batch_size, padding,
+                           backend=backend, psf_batch_size=psf_batch_size)
     return workspace.derivatives(aberration.strengths)
 
 
@@ -149,7 +181,8 @@ def optimize_aberration_3D(microscope: Microscope, grid: Arbitrary_Grid,
                            max_step: float = 0.1,
                            max_backtracks: int = 20,
                            verbose: bool = True,
-                           method: Literal['newton', 'gradient'] = 'newton'
+                           method: Literal['newton', 'gradient'] = 'newton', *,
+                           backend: str = 'auto', psf_batch_size: int = 8
                            ) -> tuple[Aberration, dict]:
     """Fit common Zernike strengths with Newton or gradient steps and backtracking.
 
@@ -174,7 +207,7 @@ def optimize_aberration_3D(microscope: Microscope, grid: Arbitrary_Grid,
     iterations (accepted steps), loss, gradient, hessian and history. History
     stores unscaled losses and copies of strengths in mode order. Estimated
     strengths describe the unknown aberration; their negatives give a
-    compensating phase in the same basis. One CPU workspace snapshots geometry,
+    compensating phase in the same basis. One workspace snapshots geometry,
     observation FFTs and diversity/defocus phases for this optimization, and
     reuses the accepted line-search fit at the next iteration. There is no
     global cache across different acquisitions. info['method'] records the
@@ -185,7 +218,8 @@ def optimize_aberration_3D(microscope: Microscope, grid: Arbitrary_Grid,
     workspace = _workspace(microscope, grid, images, focal_z_levels,
                            sample_z_levels, modes, rho, diversities,
                            mode, frequency_batch_size, padding,
-                           reuse_svd=(method == 'newton'))
+                           reuse_svd=(method == 'newton'),
+                           backend=backend, psf_batch_size=psf_batch_size)
     return workspace.optimize(
         initial_strengths=initial_strengths, max_iterations=max_iterations,
         gradient_tolerance=gradient_tolerance,
@@ -199,7 +233,7 @@ def _solve_reconstruction(microscope, grid, images, focal_z_levels,
     """Preserve the private raw-fit tuple used by existing scan notebooks."""
     workspace = _workspace(microscope, grid, images, focal_z_levels,
                            sample_z_levels, aberration.modes, rho, diversities,
-                           mode, frequency_batch_size, padding, reuse_svd=False)
+                           mode, frequency_batch_size, padding, reuse_svd=False, backend="cpu")
     fit = workspace._get_fit(workspace._strengths(aberration.strengths))[0]
     px, py = workspace.padding
     data = np.pad(np.asarray(images), ((0, 0), (px, px), (py, py)))

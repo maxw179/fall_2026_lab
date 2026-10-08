@@ -37,7 +37,7 @@ class NumericalChecks:
                 data = np.random.default_rng(3).random((k, *shape))
                 rho = float(m.compute_PSF(_convolution_grid(grid), a, mode)[2].sum()**2*.03)
                 args = (m, grid, data, focal, planes)
-                expected = cpu.evaluate_loss_derivatives_3D(*args, a, rho, diversities, mode, 7, padding)
+                expected = cpu.evaluate_loss_derivatives_3D(*args, a, rho, diversities, mode, 7, padding, backend="cpu")
                 for psf_batch, freq_batch in [(1, 7), (4, 1000)]:
                     w = gpu.CUDAReconstruction(*args, a.modes, rho, diversities, mode,
                                                freq_batch, padding, psf_batch_size=psf_batch,
@@ -47,7 +47,7 @@ class NumericalChecks:
                         np.testing.assert_allclose(np.asarray(x)/expected[0], np.asarray(y)/expected[0],
                                                    rtol=2e-8, atol=2e-9)
                     sample, info = w.sample(a.strengths, True)
-                    ref, ref_info = cpu.estimate_sample_3D(*args, a, rho, diversities, mode, 7, padding, True)
+                    ref, ref_info = cpu.estimate_sample_3D(*args, a, rho, diversities, mode, 7, padding, True, backend="cpu")
                     np.testing.assert_allclose(sample.image_mask, ref.image_mask, rtol=2e-8, atol=1e-35)
                     for key in ('loss', 'relative_residual', 'measured_relative_residual'):
                         np.testing.assert_allclose(info[key], ref_info[key], rtol=2e-9)
@@ -57,6 +57,25 @@ class NumericalChecks:
                     plus = w.derivatives(a.strengths+delta)[1]
                     minus = w.derivatives(a.strengths-delta)[1]
                     np.testing.assert_allclose((plus-minus)/(2e-5*expected[0]), actual[2][:, 0]/expected[0], rtol=2e-5, atol=1e-6)
+
+    def test_gradient_only_parity(self):
+        m = Microscope(1, .0013, 1.333, 1.05, 7.2, 4, 3.5, 15.12, 16)
+        g = Arbitrary_Grid(.003, .003, 4, 5, 0, 0, 0)
+        a = Aberration([[0, 4], [-2, 2]], [-.07, .03])
+        data = np.random.default_rng(4).random((2, 4, 5))
+        args = (m, g, data, [0, .001], [0, .001, .002])
+        target = cpu.evaluate_loss_derivatives_3D(*args, a, .01, backend='cpu')
+        workspace = gpu.CUDAReconstruction(*args, a.modes, .01, reuse_svd=False, _xp=self.xp)
+        loss, gradient = workspace.loss_gradient(a.strengths)
+        np.testing.assert_allclose(loss, target[0], rtol=2e-9)
+        np.testing.assert_allclose(gradient, target[1], rtol=2e-8, atol=2e-9*target[0])
+        self.assertEqual(workspace._last_fit.factors, [])
+        with patch.object(workspace, '_second_psf_hessian', side_effect=AssertionError('Hessian requested')):
+            actual, info = workspace.optimize(method='gradient', max_iterations=2)
+        ref, other = cpu.optimize_aberration_3D(*args, a.modes, .01, method='gradient',
+                                               max_iterations=2, verbose=False, backend='cpu')
+        np.testing.assert_allclose(actual.strengths, ref.strengths, rtol=2e-8, atol=1e-9)
+        self.assertIsNone(info['hessian'])
 
     def test_device_output_zero_data_and_public_api(self):
         m = Microscope(1, .0013, 1.333, 1.05, 7.2, 4, 3.5, 15.12, 16)
@@ -89,7 +108,7 @@ class NumericalChecks:
         modes = [[0, 4]]
         div = [Aberration(modes, [v]) for v in [-.1, .1]]
         args = (m, g, data, [0, .001], [0], modes, .01, div)
-        expected, info = cpu.optimize_aberration_3D(*args, mode='scalar', max_iterations=3, verbose=False)
+        expected, info = cpu.optimize_aberration_3D(*args, mode='scalar', max_iterations=3, verbose=False, backend='cpu')
         w = gpu.CUDAReconstruction(*args, mode='scalar', _xp=self.xp)
         actual, other = w.optimize(max_iterations=3, verbose=False)
         np.testing.assert_allclose(actual.strengths, expected.strengths, rtol=1e-7, atol=1e-9)

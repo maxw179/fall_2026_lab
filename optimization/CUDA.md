@@ -1,225 +1,112 @@
-# CUDA reconstruction
+# NVIDIA GPU optimization
 
-`reconstruction_cuda.py` implements the existing unconstrained, regularized
-3D solver on one NVIDIA GPU using CuPy. The CPU implementation remains the
-reference. Local NumPy-backend checks cover the new algorithms; real CUDA
-execution and speedups still need validation on a GPU node.
+All four public functions in `optimization.reconstruction` now default to
+`backend="auto"`: sample reconstruction, loss evaluation, analytic gradient/exact
+Hessian evaluation, and aberration optimization. Existing notebook imports and
+calls automatically use a working NVIDIA GPU through CuPy. Without CuPy or a
+usable CUDA device they use NumPy on the CPU.
 
-## Installation and validation
+```python
+from optimization import reconstruction
+print(reconstruction.get_backend())  # 'cuda' or 'cpu'
 
-The repository-root `environment.yml` describes the local Python 3.11 project
-requirements, plus JupyterLab for running notebooks. It uses portable dependency
-constraints rather than macOS build identifiers or a machine-specific prefix;
-it is not an exact lock of the local environment.
+estimated, info = reconstruction.optimize_aberration_3D(
+    microscope, grid, images, focal_z_levels, sample_z_levels,
+    modes, rho, diversities=diversities, backend="auto",
+)
+print(info["backend"])
+```
 
-After these files have been committed/pushed and pulled on the cluster, run from
-the repository root using your site's Conda installation:
+Use `backend="cpu"` to force CPU or `backend="cuda"` to require GPU. Explicit CUDA
+requests raise an error when unavailable. Errors during a GPU solve (including
+out-of-memory errors) propagate; they do not silently restart on the CPU.
+`optimization.reconstruction_cuda` exposes the same four functions for explicit
+GPU use. Both Newton and `method="gradient"` run their numerical work on the GPU.
+
+## Install on the NVIDIA machine
+
+Use the project environment, then add CuPy:
 
 ```sh
 conda env create -f environment.yml
 conda activate phase_diversity_env
-conda install --override-channels -c conda-forge cupy
+conda install -c conda-forge cupy
 ```
 
-The last command adds the GPU backend. Conda-forge's `cupy` package installs
-CUDA runtime dependencies; a separate system CUDA toolkit is normally unnecessary.
-The cluster must provide a compatible NVIDIA driver. Prefer installing CuPy from
-an allocated GPU node, where Conda can detect driver compatibility. If packages
-must be installed on a login node, use your site's supported CUDA version
-explicitly, e.g. `conda install --override-channels -c conda-forge cupy cuda-version=12.9`
-**only if that version is supported by the GPU nodes**. See the
-[official CuPy installation guide](https://docs.cupy.dev/en/stable/install.html).
-Do not also pip-install a CuPy wheel into this environment.
+Install a CuPy build compatible with the GPU machine's NVIDIA driver. The portable
+project environment keeps CuPy optional so CPU installations also work on macOS.
+See the [official installation guide](https://docs.cupy.dev/en/stable/install.html)
+for supported CUDA versions and alternative wheel installations. Do not install
+multiple CuPy distributions in one environment.
 
-Within an allocated GPU job, verify the environment:
+## Persistent workspace
+
+Reuse an acquisition for optimization, scans, and final sample estimation:
+
+```python
+solver = reconstruction.ReconstructionWorkspace(
+    microscope, grid, images, focal_z_levels, sample_z_levels,
+    modes, rho, diversities=diversities, backend="auto",
+    psf_batch_size=8, derivative_batch_size=8, frequency_batch_size=4096,
+)
+estimated, info = solver.optimize(method="newton")
+sample, diagnostics = solver.estimate_sample(estimated.strengths, return_info=True)
+```
+
+A workspace snapshots data and optical geometry. Construct a new one after
+changing them. On CUDA, construct and use it within the same current CuPy device
+context. Respect scheduler allocations through `CUDA_VISIBLE_DEVICES`. One
+workspace uses one GPU and is not safe for concurrent calls.
+
+`CUDAReconstruction` (also named `CUDAReconstructionWorkspace`) supports
+`solver.sample(strengths, return_device=True)` to return a cropped CuPy volume.
+The CUDA public `estimate_sample_3D` also accepts `return_device=True`. Otherwise
+sample outputs retain the existing `Image_Mask_3D` interface and NumPy arrays.
+Losses are host floats; returned gradients, Hessians, coefficients and optimizer
+history are small host arrays. Input image stacks may be NumPy or CuPy arrays.
+
+## Acceleration and memory
+
+GPU execution covers batched scalar/vector pupil propagation, multiphoton PSFs,
+real FFTs, regularized batched SVD fits, analytic first/second derivatives,
+reduced Hessian contractions, inverse FFTs, and residual diagnostics. Host setup
+constructs geometry and Zernike bases once. The small optimizer eigensolve and
+line-search decisions run on the host.
+
+The GPU shares the optimized CPU workspace algorithm: exact repeated PSFs are
+merged, second derivatives contract in the spatial domain without M-squared OTF
+storage, SVD factors are reused for the object response, and accepted line-search
+fits are cached. Gradient optimization skips second derivatives and retained SVD
+factors. Float64/complex128 preserve the existing optical scale and mathematics.
+
+For K images, P sample planes, M modes and Q stored real-FFT frequencies, base
+OTFs use `16*K*P*Q` bytes and first derivatives add `16*M*K*P*Q` bytes. Retained
+fields, fit factors, FFT workspaces and the CuPy pool consume additional memory.
+Use `solver.memory_summary()` for array estimates. Lower `psf_batch_size`,
+`derivative_batch_size`, or `frequency_batch_size` to reduce temporary memory.
+Use `retain_fields=False` to trade field storage for recomputation and
+`reuse_svd=False` to trade factor storage for an additional Hessian factorization.
+These settings do not reduce the full OTF arrays.
+
+## Verify and measure
 
 ```sh
-conda activate phase_diversity_env
-nvidia-smi
-python -c "import cupy as cp; cp.show_config(); print('GPUs:', cp.cuda.runtime.getDeviceCount())"
 REQUIRE_CUDA=1 python -m unittest discover -s tests -v
+python -m optimization.performance.benchmark_cuda --size 64 --pupil-size 64 --images 6 --planes 8
 ```
 
-For notebook use, register and select the remote kernel:
+Tests include scalar/vector optics, padding and boundary aliases, underdetermined
+sample fits, numerical gradient/Hessian checks, CPU parity, optimizer behavior,
+and automatic selection. Without CUDA, portable NumPy execution tests the shared
+GPU algorithm; device tests skip. `REQUIRE_CUDA=1` makes missing CUDA an error.
 
-```sh
-python -m ipykernel install --user --name phase_diversity_env --display-name "Phase diversity (cluster)"
-```
+The benchmark warms both implementations, clears caches, synchronizes the GPU,
+checks numerical parity, and reports median wall times and speedups for sample,
+loss, gradient, and Hessian operations. It excludes workspace setup and includes
+host output transfers. Use dimensions matching your acquisition for useful
+measurements. Follow the [CuPy performance guide](https://docs.cupy.dev/en/stable/user_guide/performance.html)
+when timing asynchronous device work.
 
-Activate the environment in every batch job too. If `conda activate` is not
-initialized in noninteractive shells, use your site's Conda module/setup, then:
-
-```sh
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate phase_diversity_env
-```
-
-Once validated on the cluster, record the exact solved packages for repeat runs
-on the same OS/architecture:
-
-```sh
-conda list --explicit > conda-cluster-explicit.txt
-# Later, on a compatible cluster machine:
-conda create -n phase_diversity_replay --file conda-cluster-explicit.txt
-```
-
-The portable YAML intentionally omits CUDA so it can also recreate the CPU and
-notebook environment on macOS. CuPy is added on the cluster; the explicit cluster
-snapshot includes it. Environment creation and CUDA execution have not been
-validated on a cluster yet.
-
-The ordinary test suite skips CUDA tests without a GPU; `REQUIRE_CUDA=1` makes
-missing CUDA an error. The tests exercise the same workspace with NumPy and
-CuPy and compare against the independent CPU solver, including finite differences.
-
-## Notebook use
-
-The four function names and existing positional arguments match the CPU module:
-
-```python
-from optimization import reconstruction_cuda as reconstruction
-
-estimated, info = reconstruction.optimize_aberration_3D(
-    microscope, grid, I_noisy, focal_z_levels, sample_z_levels,
-    modes, rho, diversities=diversities,
-    mode='vector', psf_batch_size=16, frequency_batch_size=1024,
-)
-```
-
-For repeated evaluations and final reconstruction, reuse a workspace:
-
-```python
-from optimization.reconstruction_cuda import CUDAReconstruction
-
-solver = CUDAReconstruction(
-    microscope, grid, I_noisy, focal_z_levels, sample_z_levels,
-    modes, rho, diversities=diversities,
-    psf_batch_size=16, frequency_batch_size=1024,
-)
-estimated, info = solver.optimize(initial_strengths=None)
-sample, diagnostics = solver.sample(estimated.strengths, return_info=True)
-# Optional: return a CuPy array rather than copying into Image_Mask_3D.
-volume_gpu = solver.sample(estimated.strengths, return_device=True)
-```
-
-Inputs may be NumPy or CuPy image arrays. Coefficients and returned optimizer
-statistics are small host arrays; the default sample is an `Image_Mask_3D`.
-A workspace snapshots geometry, acquisition data, modes and diversities. Create
-a new one after changing those inputs. Create and use it on the same current
-CUDA device; it is not thread-safe.
-
-## What runs on the GPU
-
-- Batched scalar/vector pupil propagation and multiphoton PSFs.
-- Batched periodic wrapping and real FFTs, including even-axis boundary aliases.
-- Regularized frequency-batched SVD sample fits.
-- Analytic first/second PSF derivatives and exact reduced Hessian contractions.
-- Reconstruction inverse FFTs and residual diagnostics.
-
-Observations, propagators, diversity phases and Zernike bases remain on device
-across Newton steps and backtracking. Geometry/basis construction happens once
-on the CPU. Each derivative evaluation shares one SVD per frequency between the
-sample estimate and Hessian response, including null-space directions when P>K.
-Second derivative OTFs are streamed by PSF batch rather than stored as M² stacks.
-The most recent fit is retained for repeated loss/sample requests. Accepted
-line-search trials still regenerate fields and factors for the next derivative
-evaluation; no large factorization cache is retained across iterations.
-
-The small Newton eigensolve, stopping rules and backtracking control run on the
-CPU. Float64/complex128 preserve the raw multiphoton intensity scale and small
-regularization behavior. Float32, mixed precision, multi-GPU sharding and custom
-CUDA kernels are not implemented. Double-precision throughput depends on GPU
-model; GPU speedups should be measured rather than assumed.
-
-## Memory and timing
-
-For K acquisitions, P sample planes, M modes and padded shape (Nx, Ny), let
-Q = Nx * (Ny//2+1). OTF storage is `16*K*P*Q` bytes; first derivatives require
-an additional `16*M*K*P*Q` bytes. This excludes pupil fields, observations,
-reconstruction, FFT workspaces, SVD workspaces and CuPy's memory pool.
-
-For example, K=24, P=40, M=2, padded shape 256×256 requires about 1.42 GiB for
-S and dS alone. Peak memory is higher. Lower `psf_batch_size` to reduce pupil,
-field and FFT temporary storage; lower `frequency_batch_size` to reduce SVD and
-Hessian workspace. Neither setting shrinks the full S/dS arrays. If those arrays
-do not fit, reduce problem size or use a larger-memory GPU. No silent CPU fallback
-or automatic out-of-core mode is provided.
-
-[CuPy's SVD](https://docs.cupy.dev/en/stable/reference/generated/cupy.linalg.svd.html)
-selects algorithms according to matrix dimensions; tune frequency batches on the
-target GPU. Timing must include synchronization and warmup, as described in the
-[CuPy performance guide](https://docs.cupy.dev/en/stable/user_guide/performance.html).
-The runner below does both and reports derivative wall time including host returns.
-
-## Remote batch jobs
-
-Export arrays from the notebook (units remain mm and waves):
-
-```python
-np.savez_compressed('acquisition.npz', images=I_noisy,
-                    focal_z_levels=focal_z_levels,
-                    sample_z_levels=sample_z_levels)
-```
-
-Create `config.json` using the actual experiment values. This is the schema;
-the numbers below are illustrative, especially `rho`:
-
-```json
-{
-  "microscope": {
-    "N_order": 3, "lambd": 0.0013, "n": 1.333, "num_apt": 1.05,
-    "f": 7.2, "mag": 4, "w_0": 3.5, "L_bfp": 15.12, "grid_bfp": 64
-  },
-  "grid": {
-    "L_ffp_x": 0.008, "L_ffp_y": 0.008,
-    "grid_ffp_x": 32, "grid_ffp_y": 32,
-    "x_offset": 0, "y_offset": 0, "z_level": 0
-  },
-  "modes": [[0, 4], [-2, 2]],
-  "rho": 1e48,
-  "initial_strengths": [0, 0],
-  "solver": {
-    "mode": "vector", "padding": null,
-    "psf_batch_size": 16, "frequency_batch_size": 1024
-  },
-  "optimizer": {"max_iterations": 50, "verbose": true}
-}
-```
-
-An optional `diversities` array contains one
-`{"modes": [[0,4]], "strengths": [-0.05]}` object per acquired image, in acquisition
-order. Omitting it means zero diversity, not the notebook's experimental diversity.
-
-Copy the repository, NPZ and JSON to the cluster. From the repository root,
-inside an allocated GPU environment:
-
-```sh
-python -m optimization.run_cuda acquisition.npz config.json result.npz --benchmark 5
-```
-
-The runner prints CUDA/GPU configuration, optionally benchmarks warmed derivative
-evaluations, fits coefficients and saves the sample, derivatives, optimization
-history, timings and configuration metadata. Outputs contain no pickled objects.
-Existing outputs are refused. Exit code 2 means the optimizer stopped without
-convergence; its result and status are still saved. This is a local optimizer.
-
-A Slurm template (adapt partition/account/environment activation to your site):
-
-```sh
-#!/bin/bash
-#SBATCH --job-name=reconstruct
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --time=02:00:00
-#SBATCH --output=reconstruct-%j.log
-set -euo pipefail
-# Activate your prepared Python/CUDA environment here.
-# Submit from the repository root.
-REQUIRE_CUDA=1 python -m unittest discover -s tests -p 'test_reconstruction_cuda.py' -v
-python -m optimization.run_cuda acquisition.npz config.json "result-${SLURM_JOB_ID}.npz" --benchmark 5
-```
-
-Use the scheduler's GPU allocation/`CUDA_VISIBLE_DEVICES`; device 0 is the first
-visible GPU. Independent acquisitions or starting points can run as separate jobs.
-This runner does not distribute a single solve across GPUs or submit jobs itself.
+Actual CUDA execution and speedup have not been validated on the development
+Mac. Small problems may run faster on CPU; double-precision throughput and memory
+capacity depend strongly on GPU model. No multi-GPU distribution is implemented.

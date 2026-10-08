@@ -1,6 +1,6 @@
-"""NumPy reconstruction workspace with an exact reduced-objective Hessian.
+"""Shared reconstruction workspace with an exact reduced-objective Hessian.
 
-The public reconstruction APIs use this workspace by default.
+The CPU uses NumPy; the CUDA subclass selects CuPy for large runtime arrays.
 It snapshots the optical setup and data: construct a new workspace after changing
 images, planes, diversities, microscope parameters, modes, padding, or rho.
 No PSF normalization, coordinate rounding, or precision reduction is used.
@@ -47,11 +47,16 @@ class CPUReconstructionWorkspace:
     The workspace is mutable and should not be shared between concurrent calls.
     """
 
+    xp = np
+    backend = "cpu"
+
     def __init__(self, microscope, grid, images, focal_z_levels,
                  sample_z_levels, modes, rho, diversities=None, mode="vector",
                  frequency_batch_size=4096, padding=None, psf_batch_size=8,
                  derivative_batch_size=8, reuse_svd=True, spatial_hessian=True,
-                 deduplicate_psfs=True, retain_fields=True, cache_last_fit=True):
+                 deduplicate_psfs=True, retain_fields=True, cache_last_fit=True, *, _xp=np):
+        self.xp = xp = _xp
+        self.backend = "cpu" if xp is np else "cuda"
         for name, value in [("frequency_batch_size", frequency_batch_size),
                             ("psf_batch_size", psf_batch_size),
                             ("derivative_batch_size", derivative_batch_size)]:
@@ -75,9 +80,9 @@ class CPUReconstructionWorkspace:
         if not np.isfinite(rho) or rho <= 0:
             raise ValueError("rho must be finite and strictly positive.")
         original_shape = (grid.grid_ffp_x, grid.grid_ffp_y)
-        data = np.asarray(images)
+        data = xp.asarray(images, dtype=None)
         if (data.shape != (len(self.focal_z), *original_shape)
-                or not np.isrealobj(data) or not np.all(np.isfinite(data))):
+                or data.dtype.kind not in "buif" or not bool(xp.all(xp.isfinite(data)))):
             raise ValueError("images must be a finite real array with shape (K, x, y).")
         if diversities is None:
             diversities = [EmptyAberration()] * len(self.focal_z)
@@ -95,14 +100,14 @@ class CPUReconstructionWorkspace:
             raise ValueError("padding must be a nonnegative integer or a pair of them.")
         self.padding = tuple(map(int, padding))
         px, py = self.padding
-        data = np.pad(data, ((0, 0), (px, px), (py, py)))
+        data = xp.pad(data.astype(xp.float64), ((0, 0), (px, px), (py, py)))
         self.shape = data.shape[1:]
         self.grid = _grid_at_z(grid, grid.z_level)
-        self.data_norm = float(np.linalg.norm(data))
+        self.data_norm = float(xp.linalg.norm(data))
         self.crop = (slice(None), slice(px, px + original_shape[0]),
                      slice(py, py + original_shape[1]))
-        self.observed = np.fft.rfft2(data).reshape(len(self.focal_z), -1)
-        self.weights = _frequency_weights(self.shape)
+        self.observed = xp.fft.rfft2(data).reshape(len(self.focal_z), -1)
+        self.weights = xp.asarray(_frequency_weights(self.shape))
         self.rho = float(rho)
         self.order = microscope.N_order
         self.frequency_batch_size = int(frequency_batch_size)
@@ -115,13 +120,23 @@ class CPUReconstructionWorkspace:
         self.cache_last_fit = bool(cache_last_fit)
         self._last_fit = None
 
-        geometry = _derivative_geometry(microscope, kernel_grid, self.modes, mode)
+        geometry = _derivative_geometry(microscope, kernel_grid, self.modes, mode, xp=xp)
         self.amplitudes, mask, theta, phi, sz, basis, self._propagate = geometry
-        self.basis = np.asarray(basis)
+        self.amplitudes = xp.asarray(self.amplitudes)
+        self.basis = xp.asarray(np.asarray(basis))
         self._indices = tuple((np.arange(n) - n // 2) % size
                               for n, size in zip(self.kernel_shape, self.shape))
         self._unique_indices = all(n <= size for n, size
                                    in zip(self.kernel_shape, self.shape))
+        axes = []
+        for ids in self._indices:
+            cuts = np.r_[0, np.flatnonzero(np.diff(ids) != 1) + 1, len(ids)]
+            axes.append([(slice(int(a), int(b)),
+                          slice(int(ids[a]), int(ids[b - 1]) + 1))
+                         for a, b in zip(cuts[:-1], cuts[1:])])
+        self._wrap_blocks = [(sx, sy, dx, dy) for sx, dx in axes[0]
+                             for sy, dy in axes[1]]
+        self._indices = tuple(xp.asarray(ids) for ids in self._indices)
 
         # Compare actual fixed phase arrays, including diversity modes outside
         # the optimized basis. Exact keys deliberately do not merge nearby z.
@@ -154,7 +169,7 @@ class CPUReconstructionWorkspace:
                 else:
                     group_index = group_lookup[key]
                 self.groups[group_index].append((k, p))
-        self.fixed_phases = np.asarray(fixed_phases)
+        self.fixed_phases = xp.asarray(np.asarray(fixed_phases))
         self.pairs = list(combinations_with_replacement(range(len(self.modes)), 2))
 
     def clear_cache(self):
@@ -167,44 +182,49 @@ class CPUReconstructionWorkspace:
             raise ValueError("Provide one finite initial strength per mode.")
         return strengths
 
+    def _host(self, value):
+        return np.asarray(value) if self.xp is np else self.xp.asnumpy(value)
+
+    def _svd(self, matrices, full_matrices):
+        if self.xp is np:
+            return np.linalg.svd(matrices, full_matrices=full_matrices)
+        import cupyx
+        with cupyx.errstate(linalg="raise"):
+            return self.xp.linalg.svd(self.xp.ascontiguousarray(matrices),
+                                      full_matrices=full_matrices)
+
     def _transform(self, kernels):
-        """Wrap and transform a batch, preserving aliased edge contributions."""
+        """Wrap contiguous blocks, summing even-axis aliases without atomics."""
         leading = kernels.shape[:-2]
-        periodic = np.zeros((*leading, *self.shape), dtype=float)
-        ix, iy = self._indices
-        if self._unique_indices:
-            periodic[..., ix[:, None], iy[None, :]] = kernels
-        else:
-            count = int(np.prod(leading)) if leading else 1
-            flat = periodic.reshape(count, *self.shape)
-            np.add.at(flat, (np.arange(count)[:, None, None],
-                            ix[None, :, None], iy[None, None, :]),
-                      kernels.reshape(count, *self.kernel_shape))
-        return np.fft.rfft2(periodic).reshape(*leading, len(self.weights))
+        periodic = self.xp.zeros((*leading, *self.shape), dtype=float)
+        for sx, sy, dx, dy in self._wrap_blocks:
+            periodic[..., dx, dy] += kernels[..., sx, sy]
+        return self.xp.fft.rfft2(periodic).reshape(*leading, len(self.weights))
 
     def _field_batches(self, strengths, first):
-        common_phase = np.exp(1j * np.tensordot(strengths, self.basis, axes=1))
+        common_phase = self.xp.exp(1j * self.xp.tensordot(self.xp.asarray(strengths), self.basis, axes=1))
         for start in range(0, len(self.groups), self.psf_batch_size):
             ids = range(start, min(start + self.psf_batch_size, len(self.groups)))
             pupils = (self.fixed_phases[start:start + len(ids), None]
                       * common_phase * self.amplitudes[None])
             field = self._propagate(pupils)
-            intensity = np.sum(abs(field)**2, axis=1)
+            intensity = self.xp.sum(abs(field)**2, axis=1)
             first_fields = d_intensity = None
             if first:
-                first_fields = np.empty((len(ids), len(self.modes), *field.shape[1:]),
+                first_fields = self.xp.empty((len(ids), len(self.modes), *field.shape[1:]),
                                         dtype=complex)
                 for j in range(0, len(self.modes), self.derivative_batch_size):
                     z = self.basis[j:j + self.derivative_batch_size]
                     first_fields[:, j:j + len(z)] = self._propagate(
                         1j * z[None, :, None] * pupils[:, None])
-                d_intensity = 2*np.real(np.sum(field[:, None].conj() * first_fields, axis=2))
+                d_intensity = 2*self.xp.real(self.xp.sum(field[:, None].conj() * first_fields, axis=2))
             yield ids, pupils, field, intensity, first_fields, d_intensity
+
 
     def _build_otfs(self, strengths, first=False, include_base=True, retain_fields=None):
         shape = (len(self.focal_z), len(self.sample_z), len(self.weights))
-        otfs = np.empty(shape, dtype=complex) if include_base else None
-        d_otfs = np.empty((len(self.modes), *shape), dtype=complex) if first else None
+        otfs = self.xp.empty(shape, dtype=complex) if include_base else None
+        d_otfs = self.xp.empty((len(self.modes), *shape), dtype=complex) if first else None
         retain_fields = self.retain_fields if retain_fields is None else retain_fields
         records = [] if first and retain_fields else None
         for record in self._field_batches(strengths, first):
@@ -223,8 +243,9 @@ class CPUReconstructionWorkspace:
                 records.append(record)
         return otfs, d_otfs, records
 
+
     def _solve(self, otfs):
-        estimated = np.empty((len(self.sample_z), len(self.weights)), dtype=complex)
+        estimated = self.xp.empty((len(self.sample_z), len(self.weights)), dtype=complex)
         factors = []
         # A reduced SVD already has a complete right basis when K >= P.
         full = self.reuse_svd and len(self.sample_z) > len(self.focal_z)
@@ -232,7 +253,7 @@ class CPUReconstructionWorkspace:
             stop = min(start + self.frequency_batch_size, len(self.weights))
             s = otfs[:, :, start:stop].transpose(2, 0, 1)
             d = self.observed[:, start:stop].T
-            u, singular, vh = np.linalg.svd(s, full_matrices=full)
+            u, singular, vh = self._svd(s, full_matrices=full)
             rank = singular.shape[1]
             projected = (u[:, :, :rank].conj().swapaxes(-1, -2) @ d[..., None])[..., 0]
             weighted = singular / (singular**2 + self.rho) * projected
@@ -241,6 +262,7 @@ class CPUReconstructionWorkspace:
             if self.reuse_svd:
                 factors.append((start, stop, singular, vh))
         return estimated, factors
+
 
     def _get_fit(self, strengths, first=False, retain_fields=None):
         if (self.cache_last_fit and self._last_fit is not None
@@ -251,13 +273,14 @@ class CPUReconstructionWorkspace:
             build_options['retain_fields'] = retain_fields
         otfs, d_otfs, records = self._build_otfs(strengths, **build_options)
         estimated, factors = self._solve(otfs)
-        residual = self.observed - np.einsum("kpf,pf->kf", otfs, estimated)
-        loss = float(np.sum(self.weights * (np.sum(abs(residual)**2, axis=0)
-                     + self.rho * np.sum(abs(estimated)**2, axis=0))))
+        residual = self.observed - self.xp.einsum("kpf,pf->kf", otfs, estimated)
+        loss = float(self.xp.sum(self.weights * (self.xp.sum(abs(residual)**2, axis=0)
+                     + self.rho * self.xp.sum(abs(estimated)**2, axis=0))))
         fit = _Fit(strengths.copy(), otfs, estimated, residual, loss, factors)
         if self.cache_last_fit:
             self._last_fit = fit
         return fit, d_otfs, records
+
 
     def loss(self, strengths):
         return self._get_fit(self._strengths(strengths))[0].loss
@@ -279,30 +302,31 @@ class CPUReconstructionWorkspace:
         if d_otfs is None:
             _, d_otfs, _ = self._build_otfs(
                 strengths, first=True, include_base=False, retain_fields=False)
-        gradient = np.zeros(len(self.modes))
+        gradient = self.xp.zeros(len(self.modes))
         for start in range(0, len(self.weights), self.frequency_batch_size):
             sl = slice(start, start + self.frequency_batch_size)
             ds = d_otfs[:, :, :, sl].transpose(3, 0, 1, 2)
             f, residual = fit.estimated[:, sl].T, fit.residual[:, sl].T
-            q = np.einsum('bmkp,bp->bmk', ds, f)
-            gradient -= 2*np.real(np.einsum(
+            q = self.xp.einsum('bmkp,bp->bmk', ds, f)
+            gradient -= 2*self.xp.real(self.xp.einsum(
                 'b,bk,bmk->m', self.weights[sl], residual.conj(), q))
         if self.cache_last_fit:
             fit.gradient = gradient.copy()
         return fit.loss, gradient
 
+
     def _second_psf_hessian(self, strengths, fit, records):
-        hessian = np.zeros((len(self.modes), len(self.modes)))
+        hessian = self.xp.zeros((len(self.modes), len(self.modes)))
         batches = records if records is not None else self._field_batches(strengths, True)
         ix, iy = self._indices
         for ids, pupils, field, intensity, first_fields, d_intensity in batches:
             # Sum repeated PSFs' contractions before performing an inverse FFT.
-            correlation_f = np.zeros((len(ids), len(self.weights)), dtype=complex)
+            correlation_f = self.xp.zeros((len(ids), len(self.weights)), dtype=complex)
             for b, group in enumerate(ids):
                 for k, p in self.groups[group]:
                     correlation_f[b] += fit.residual[k] * fit.estimated[p].conj()
             if self.spatial_hessian:
-                correlation = np.fft.irfft2(correlation_f.reshape(
+                correlation = self.xp.fft.irfft2(correlation_f.reshape(
                     len(ids), self.shape[0], self.shape[1]//2 + 1), s=self.shape)
                 correlation = correlation[:, ix[:, None], iy[None, :]]
             first_factor = self.order * intensity**(self.order - 1)
@@ -313,20 +337,21 @@ class CPUReconstructionWorkspace:
                 j, l = np.asarray(pairs).T
                 second_fields = self._propagate(
                     -(self.basis[j] * self.basis[l])[None, :, None] * pupils[:, None])
-                dd_intensity = 2*np.real(np.sum(
+                dd_intensity = 2*self.xp.real(self.xp.sum(
                     first_fields[:, j].conj() * first_fields[:, l]
                     + field[:, None].conj() * second_fields, axis=2))
                 dd_psf = first_factor[:, None] * dd_intensity
                 if second_factor is not None:
                     dd_psf += second_factor[:, None] * d_intensity[:, j] * d_intensity[:, l]
                 if self.spatial_hessian:
-                    values = -2*np.prod(self.shape) * np.einsum(
+                    values = -2*np.prod(self.shape) * self.xp.einsum(
                         "bxy,bjxy->j", correlation, dd_psf)
                 else:
-                    values = -2*np.real(np.einsum("f,bf,bjf->j", self.weights,
+                    values = -2*self.xp.real(self.xp.einsum("f,bf,bjf->j", self.weights,
                         correlation_f.conj(), self._transform(dd_psf)))
                 hessian[j, l] += values
-        return hessian + np.triu(hessian, 1).T
+        return hessian + self.xp.triu(hessian, 1).T
+
 
     def derivatives(self, strengths):
         """Return the same profiled (loss, gradient, exact Hessian) as the reference."""
@@ -337,7 +362,7 @@ class CPUReconstructionWorkspace:
             return fit.loss, gradient.copy(), hessian.copy()
         if d_otfs is None:
             _, d_otfs, records = self._build_otfs(strengths, first=True, include_base=False)
-        gradient = np.zeros(len(self.modes))
+        gradient = self.xp.zeros(len(self.modes))
         hessian = self._second_psf_hessian(strengths, fit, records)
         # Fields are not part of the persistent cache; release them before the
         # object-response contractions, which allocate frequency-batch arrays.
@@ -348,45 +373,47 @@ class CPUReconstructionWorkspace:
             s = fit.otfs[:, :, sl].transpose(2, 0, 1)
             ds = d_otfs[:, :, :, sl].transpose(3, 0, 1, 2)
             f, residual = fit.estimated[:, sl].T, fit.residual[:, sl].T
-            q = np.einsum("bmkp,bp->bmk", ds, f)
-            c = (np.einsum("bmkp,bk->bpm", ds.conj(), residual)
-                 - np.einsum("bkp,bmk->bpm", s.conj(), q))
+            q = self.xp.einsum("bmkp,bp->bmk", ds, f)
+            c = (self.xp.einsum("bmkp,bk->bpm", ds.conj(), residual)
+                 - self.xp.einsum("bkp,bmk->bpm", s.conj(), q))
             if self.reuse_svd:
                 _, _, singular, vh = fit.factors[batch]
             else:
-                _, singular, vh = np.linalg.svd(s, full_matrices=True)
-            denom = np.full((len(s), len(self.sample_z)), self.rho)
+                _, singular, vh = self._svd(s, full_matrices=True)
+            denom = self.xp.full((len(s), len(self.sample_z)), self.rho)
             denom[:, :singular.shape[1]] += singular**2
             response = vh.conj().swapaxes(-1, -2) @ ((vh @ c) / denom[..., None])
             w = self.weights[sl]
-            gradient -= 2*np.real(np.einsum("b,bk,bmk->m", w, residual.conj(), q))
-            hessian += 2*np.real(
-                np.einsum("b,bmk,bnk->mn", w, q.conj(), q)
-                - np.einsum("b,bpm,bpn->mn", w, c.conj(), response))
+            gradient -= 2*self.xp.real(self.xp.einsum("b,bk,bmk->m", w, residual.conj(), q))
+            hessian += 2*self.xp.real(
+                self.xp.einsum("b,bmk,bnk->mn", w, q.conj(), q)
+                - self.xp.einsum("b,bpm,bpn->mn", w, c.conj(), response))
         hessian = (hessian + hessian.T) / 2
         if self.cache_last_fit:
             fit.derivatives = (gradient.copy(), hessian.copy())
         return fit.loss, gradient, hessian
 
+
     def estimate_sample(self, strengths, return_info=False):
         """Return the cropped real sample, with optional padded-fit diagnostics."""
         fit = self._get_fit(self._strengths(strengths))[0]
-        result = np.fft.irfft2(fit.estimated.reshape(
+        result = self.xp.fft.irfft2(fit.estimated.reshape(
             len(self.sample_z), self.shape[0], self.shape[1]//2 + 1), s=self.shape)
         sample = Image_Mask_3D([
             Image_Mask(_grid_at_z(self.grid, level), plane)
-            for level, plane in zip(self.sample_z, result[self.crop])])
+            for level, plane in zip(self.sample_z, self._host(result[self.crop]))])
         if not return_info:
             return sample
-        residual = np.fft.irfft2((-fit.residual).reshape(
+        residual = self.xp.fft.irfft2((-fit.residual).reshape(
             len(self.focal_z), self.shape[0], self.shape[1]//2 + 1), s=self.shape)
         # Padding adds only zeros, so padded and measured data norms are equal.
-        info = dict(padding=self.padding, padded_shape=self.shape, loss=fit.loss,
-                    relative_residual=float(np.linalg.norm(residual)/self.data_norm)
+        info = dict(padding=self.padding, padded_shape=self.shape, loss=fit.loss, backend=self.backend,
+                    relative_residual=float(self.xp.linalg.norm(residual)/self.data_norm)
                         if self.data_norm else 0.0,
-                    measured_relative_residual=float(np.linalg.norm(residual[self.crop])/self.data_norm)
+                    measured_relative_residual=float(self.xp.linalg.norm(residual[self.crop])/self.data_norm)
                         if self.data_norm else 0.0)
         return sample, info
+
 
     def memory_summary(self):
         """Array storage estimates; these are not process peak-memory measurements."""
@@ -510,4 +537,4 @@ class CPUReconstructionWorkspace:
         return Aberration(self.modes.copy(), strengths), dict(
             success=success, message=message, iterations=len(history)-1,
             loss=loss, gradient=gradient, hessian=hessian, history=history,
-            method=method)
+            method=method, backend=self.backend)

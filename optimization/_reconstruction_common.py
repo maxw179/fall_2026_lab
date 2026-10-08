@@ -45,7 +45,7 @@ class _KernelTransform:
         return np.fft.rfft2(self.periodic).ravel()
 
 
-def _derivative_geometry(microscope, grid, modes, mode):
+def _derivative_geometry(microscope, grid, modes, mode, *, xp=np):
     """Prepare phase-independent pupil geometry for an acquisition workspace."""
     from utils.rw import (get_bfp_grid, bfp_coord_convert,
                           gaussian_amplitude_s_perp, strength_angular)
@@ -69,6 +69,8 @@ def _derivative_geometry(microscope, grid, modes, mode):
     x, y = grid.get_xy()
     Ax = np.exp(1j*m.k*np.outer(x, sx[:, 0]))
     Ay = np.exp(1j*m.k*np.outer(sy[0, :], y))
+
+    Ax, Ay = xp.asarray(Ax), xp.asarray(Ay)
 
     def propagate(p):
         return scale * (Ax @ p @ Ay)
