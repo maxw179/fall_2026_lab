@@ -88,6 +88,74 @@ Use `retain_fields=False` to trade field storage for recomputation and
 `reuse_svd=False` to trade factor storage for an additional Hessian factorization.
 These settings do not reduce the full OTF arrays.
 
+## Experimental QR reduction for rectangular SVDs
+
+The 128x128 / 24-image / 40-plane benchmark measured on Bouchet's RTX 5000
+Ada took about 55 seconds for each GPU operation, versus 5.04 seconds for CPU
+loss and 16.14 seconds for CPU loss/gradient/Hessian. Numerical parity passed.
+Those nearly equal GPU times suggest shared fit work dominates; stage profiling
+on the device is still needed to attribute the measured time.
+
+CuPy 14.2 uses a separate cuSOLVER SVD for each frequency when either matrix
+dimension exceeds 32. The padded benchmark has 33,024 stored frequencies, each
+with a 24x40 operator. Merely increasing frequency_batch_size does not eliminate
+that per-frequency loop.
+
+An opt-in CUDA workspace option avoids that dispatch for eligible operators:
+
+```python
+solver = reconstruction.ReconstructionWorkspace(
+    microscope, grid, images, focal_z_levels, sample_z_levels,
+    modes, rho, diversities=diversities, backend="cuda",
+    svd_method="qr",
+)
+```
+
+For S shaped KxP with K<P, this computes a batched Householder QR of S^H, then
+the SVD of the KxK triangular factor's adjoint. A 24x40 SVD becomes a 24x24
+SVD, eligible for CuPy's fast batched Jacobi implementation. The QR uses array
+operations across all frequencies, rather than a single-matrix QR in a Python
+loop. Tall operators use QR of S instead. Full right bases retain null-space
+directions for the exact Hessian. There is no Gram matrix, singular-value
+truncation, precision reduction, or change to physical planes, rho or padding.
+
+Reduction applies only when min(K,P)<=32<max(K,P). Other shapes use the existing
+SVD. Frequencies with sum(abs(S)**2)/rho > 1e6 also use the existing SVD: this
+is a conservative numerical guard motivated by derivative sensitivity under
+very weak regularization, not a universal error bound. The benchmark reports
+QR/direct frequency counts when profiling. Always verify loss, sample, gradient,
+Hessian and optimizer agreement on the real acquisition.
+
+The default remains svd_method="direct". Portable NumPy checks validate the
+factorization, extreme scales, rank deficiency, full null-space response, cached
+fits, optical derivatives and finite differences, Newton and random screening.
+The QR path has not yet been executed or timed on actual CUDA hardware.
+
+On Bouchet, after pushing/pulling these changes and within a GPU allocation:
+
+```sh
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+REQUIRE_CUDA=1 python -m unittest discover -s tests -p test_batched_svd.py -v
+python -u -m optimization.performance.benchmark_cuda --size 128 --pupil-size 128 --images 24 --planes 40 --cuda-svd qr --profile --repeats 3 > benchmark_qr.json
+```
+
+The new benchmark checks three coefficient points, including a cached loss fit
+and reconstructed samples, before timing. It interleaves warmed backends in
+random order, clears fit caches and synchronizes GPU completion. Profiles are
+separate calls with synchronization at stage boundaries; inclusive/exclusive
+stage times have profiling overhead and must not be substituted for the normal
+operation timings. GPU model, runtime/driver versions, raw repeats and listed
+workspace memory estimates are saved in the JSON. Progress goes to stderr.
+
+Use --cuda-svd compare to time CPU, original CUDA and QR CUDA together. Increase
+--modes to match the real fit (default 2), and try --psf-batch-size 32 and
+--derivative-batch-size 16 after profiling. Larger batches increase memory.
+Add --optimize --max-iterations 20 --random-starts 100 to measure a full Newton
+run and seeded initialization; optimizer strengths and loss are checked against
+CPU. These synthetic random-image runs measure timing/parity, not successful
+recovery of a physical aberration. Benchmark actual acquisitions and time to
+equivalent wavefront accuracy before choosing an optimizer or GPU.
+
 ## Verify and measure
 
 ```sh
