@@ -210,7 +210,7 @@ class AberrationOptimizationTests(unittest.TestCase):
                      loss(aberration=Aberration([[0, 4]], s))):
                 result, info = optimize_aberration_3D(
                     None, None, None, [0], [0], [[0, 4]], 1,
-                    gradient_tolerance=1e-9, verbose=False)
+                    gradient_tolerance=1e-9, verbose=False, num_random_starts=0)
             self.assertTrue(info['success'], info['message'])
             self.assertAlmostEqual(abs(result.strengths[0]), .2, places=6)
             self.assertTrue(np.all(np.diff([h['loss'] for h in info['history']]) < 0))
@@ -227,7 +227,7 @@ class AberrationOptimizationTests(unittest.TestCase):
         rho = float(m.compute_PSF(grid, truth, 'scalar')[2].sum()**2 * 1e-6)
         estimated, info = optimize_aberration_3D(
             m, grid, data, [0]*3, [0], [[0, 4]], rho, diversities,
-            mode='scalar', padding=0, verbose=False)
+            mode='scalar', padding=0, verbose=False, num_random_starts=0)
         self.assertTrue(info['success'], info['message'])
         self.assertAlmostEqual(estimated.strengths[0], -.08, places=4)
         self.assertLess(info['loss'], info['history'][0]['loss'])
@@ -246,7 +246,7 @@ class AberrationOptimizationTests(unittest.TestCase):
              patch.object(workspace, 'loss', side_effect=lambda s:
                  derivatives(aberration=Aberration([[0, 4]], s))[0]):
             result, info = optimize_aberration_3D(None, None, None, [0], [0], [[0, 4]],
-                                                1, max_iterations=1, verbose=False)
+                                                1, max_iterations=1, verbose=False, num_random_starts=0)
         self.assertFalse(info['success'])
         self.assertEqual(info['iterations'], 1)
         self.assertAlmostEqual(result.strengths[0], .1)

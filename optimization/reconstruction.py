@@ -43,9 +43,11 @@ def ReconstructionWorkspace(*args, backend="auto", **kwargs):
 
 def _workspace(microscope, grid, images, focal_z_levels, sample_z_levels,
                modes, rho, diversities, mode, frequency_batch_size, padding,
-               *, reuse_svd=True, backend="auto", psf_batch_size=8):
+               *, reuse_svd=True, backend="auto", psf_batch_size=8,
+               propagation="auto", fft_workers=1, cpu_workers=1):
     return ReconstructionWorkspace(
         backend=backend, psf_batch_size=psf_batch_size,
+        propagation=propagation, fft_workers=fft_workers, cpu_workers=cpu_workers,
         microscope=microscope, grid=grid, images=images,
         focal_z_levels=focal_z_levels, sample_z_levels=sample_z_levels,
         modes=modes, rho=rho, diversities=diversities, mode=mode,
@@ -63,7 +65,8 @@ def estimate_sample_3D(microscope: Microscope, grid: Arbitrary_Grid,
                        frequency_batch_size: int = 4096,
                        padding: int | tuple[int, int] | None = None,
                        return_info: bool = False, *,
-                       backend: str = "auto", psf_batch_size: int = 8):
+                       backend: str = "auto", psf_batch_size: int = 8,
+                     propagation: str = "auto", fft_workers: int = 1, cpu_workers: int = 1):
     """
     Estimates a 3D sample using the regularized Gaussian object estimator in math.tex.
     Zero-pads the acquired stack, applies the frequency-wise regularized SVD solve,
@@ -89,6 +92,9 @@ def estimate_sample_3D(microscope: Microscope, grid: Arbitrary_Grid,
             None uses half the PSF size on each axis; zero gives the unpadded solver
         backend (str): auto (default), cpu, or cuda; CUDA requires working CuPy
         psf_batch_size (int): maximum unique PSFs propagated together
+        propagation (str): auto/dense (default CPU matrix sums), or zoom (CPU only)
+        fft_workers (int): CPU FFT thread count; default 1
+        cpu_workers (int): parallel CPU SVD batches; default 1
         return_info (bool): whether to also return padded-domain fit diagnostics
     Returns:
         sample (Image_Mask_3D): real-valued estimate at the requested P planes
@@ -99,7 +105,8 @@ def estimate_sample_3D(microscope: Microscope, grid: Arbitrary_Grid,
     workspace = _workspace(microscope, grid, images, focal_z_levels,
                            sample_z_levels, aberration.modes, rho, diversities,
                            mode, frequency_batch_size, padding, reuse_svd=False,
-                           backend=backend, psf_batch_size=psf_batch_size)
+                           backend=backend, psf_batch_size=psf_batch_size,
+                           propagation=propagation, fft_workers=fft_workers, cpu_workers=cpu_workers)
     return workspace.estimate_sample(aberration.strengths, return_info=return_info)
 
 
@@ -112,7 +119,8 @@ def evaluate_loss_3D(microscope: Microscope, grid: Arbitrary_Grid,
                      mode: Literal['scalar', 'vector'] = 'vector',
                      frequency_batch_size: int = 4096,
                      padding: int | tuple[int, int] | None = None, *,
-                     backend: str = "auto", psf_batch_size: int = 8) -> float:
+                     backend: str = "auto", psf_batch_size: int = 8,
+                     propagation: str = "auto", fft_workers: int = 1, cpu_workers: int = 1) -> float:
     """Evaluate the regularized Gaussian loss at a given aberration.
 
     Uses the batched selected-backend workspace to fit the sample and returns
@@ -128,7 +136,8 @@ def evaluate_loss_3D(microscope: Microscope, grid: Arbitrary_Grid,
     workspace = _workspace(microscope, grid, images, focal_z_levels,
                            sample_z_levels, aberration.modes, rho, diversities,
                            mode, frequency_batch_size, padding, reuse_svd=False,
-                           backend=backend, psf_batch_size=psf_batch_size)
+                           backend=backend, psf_batch_size=psf_batch_size,
+                           propagation=propagation, fft_workers=fft_workers, cpu_workers=cpu_workers)
     return workspace.loss(aberration.strengths)
 
 
@@ -141,7 +150,8 @@ def evaluate_loss_derivatives_3D(microscope: Microscope, grid: Arbitrary_Grid,
                                  mode: Literal['scalar', 'vector'] = 'vector',
                                  frequency_batch_size: int = 4096,
                                  padding: int | tuple[int, int] | None = None, *,
-                                 backend: str = "auto", psf_batch_size: int = 8
+                                 backend: str = "auto", psf_batch_size: int = 8,
+                                 propagation: str = "auto", fft_workers: int = 1, cpu_workers: int = 1
                                  ) -> tuple[float, np.ndarray, np.ndarray]:
     """Return (loss, gradient, Hessian) of the fitted-sample Gaussian loss.
 
@@ -160,7 +170,8 @@ def evaluate_loss_derivatives_3D(microscope: Microscope, grid: Arbitrary_Grid,
     workspace = _workspace(microscope, grid, images, focal_z_levels,
                            sample_z_levels, aberration.modes, rho, diversities,
                            mode, frequency_batch_size, padding,
-                           backend=backend, psf_batch_size=psf_batch_size)
+                           backend=backend, psf_batch_size=psf_batch_size,
+                           propagation=propagation, fft_workers=fft_workers, cpu_workers=cpu_workers)
     return workspace.derivatives(aberration.strengths)
 
 
@@ -182,12 +193,24 @@ def optimize_aberration_3D(microscope: Microscope, grid: Arbitrary_Grid,
                            max_backtracks: int = 20,
                            verbose: bool = True,
                            method: Literal['newton', 'gradient'] = 'newton', *,
-                           backend: str = 'auto', psf_batch_size: int = 8
+                           backend: str = 'auto', psf_batch_size: int = 8,
+                           propagation: str = "auto", fft_workers: int = 1, cpu_workers: int = 1,
+                           on_iteration=None, on_progress=None,
+                           num_random_starts: int = 100,
+                           random_start_rms_range=(0.005, 0.50), random_start_seed=0,
+                           show_initialization_progress: bool = True
                            ) -> tuple[Aberration, dict]:
     """Fit common Zernike strengths with Newton or gradient steps and backtracking.
 
-    ``modes`` contains [m, n] pairs. Starting strengths default to zero waves;
-    known diversities stay fixed while the sample is refitted at every trial.
+    ``modes`` contains [m, n] pairs. Initialization screens 100 random phases
+    by loss, plus zero and any supplied initial_strengths. Gaussian coefficient
+    directions are rescaled to log-uniform pupil RMS in [0.005, 0.50] waves.
+    num_random_starts changes the count; zero disables screening and uses
+    initial_strengths (zero if omitted). random_start_seed=0 is reproducible;
+    None requests a fresh pool. random_start_rms_range controls RMS bounds.
+    A separate tqdm bar tracks completed screening loss calls; disable it with
+    show_initialization_progress=False independently of verbose.
+    Known diversities stay fixed while the sample is refitted at every trial.
     Prints the initial point and every accepted step unless verbose=False.
     max_step bounds the largest coefficient change per step, in waves.
     method='newton' uses the exact Hessian (default). method='gradient' uses
@@ -212,6 +235,11 @@ def optimize_aberration_3D(microscope: Microscope, grid: Arbitrary_Grid,
     reuses the accepted line-search fit at the next iteration. There is no
     global cache across different acquisitions. info['method'] records the
     selected method; info['hessian'] is None in gradient mode.
+    info['initialization'] records screened points, losses, the selected point
+    and screening time (None when num_random_starts=0).
+    on_iteration receives a diagnostic dict after each derivative evaluation,
+    including iteration, loss, strengths, scaled_gradient_inf, backend and method.
+    on_progress receives stage dicts before derivatives and line-search fits.
     """
     if method not in ('newton', 'gradient'):
         raise ValueError("method must be 'newton' or 'gradient'.")
@@ -219,12 +247,17 @@ def optimize_aberration_3D(microscope: Microscope, grid: Arbitrary_Grid,
                            sample_z_levels, modes, rho, diversities,
                            mode, frequency_batch_size, padding,
                            reuse_svd=(method == 'newton'),
-                           backend=backend, psf_batch_size=psf_batch_size)
+                           backend=backend, psf_batch_size=psf_batch_size,
+                           propagation=propagation, fft_workers=fft_workers, cpu_workers=cpu_workers)
     return workspace.optimize(
         initial_strengths=initial_strengths, max_iterations=max_iterations,
         gradient_tolerance=gradient_tolerance,
         strength_tolerance=strength_tolerance, max_step=max_step,
-        max_backtracks=max_backtracks, verbose=verbose, method=method)
+        max_backtracks=max_backtracks, verbose=verbose, method=method,
+        on_iteration=on_iteration, on_progress=on_progress,
+        num_random_starts=num_random_starts,
+        random_start_rms_range=random_start_rms_range, random_start_seed=random_start_seed,
+        show_initialization_progress=show_initialization_progress)
 
 
 def _solve_reconstruction(microscope, grid, images, focal_z_levels,

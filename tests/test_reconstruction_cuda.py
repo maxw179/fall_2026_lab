@@ -71,9 +71,9 @@ class NumericalChecks:
         np.testing.assert_allclose(gradient, target[1], rtol=2e-8, atol=2e-9*target[0])
         self.assertEqual(workspace._last_fit.factors, [])
         with patch.object(workspace, '_second_psf_hessian', side_effect=AssertionError('Hessian requested')):
-            actual, info = workspace.optimize(method='gradient', max_iterations=2)
+            actual, info = workspace.optimize(method='gradient', max_iterations=2, num_random_starts=0)
         ref, other = cpu.optimize_aberration_3D(*args, a.modes, .01, method='gradient',
-                                               max_iterations=2, verbose=False, backend='cpu')
+                                               max_iterations=2, verbose=False, backend='cpu', num_random_starts=0)
         np.testing.assert_allclose(actual.strengths, ref.strengths, rtol=2e-8, atol=1e-9)
         self.assertIsNone(info['hessian'])
 
@@ -97,7 +97,7 @@ class NumericalChecks:
             np.testing.assert_array_equal(gradient, [0.])
             np.testing.assert_array_equal(hessian, [[0.]])
             estimated, result = gpu.optimize_aberration_3D(
-                m, g, data, [0], [0], a.modes, .01, verbose=False)
+                m, g, data, [0], [0], a.modes, .01, verbose=False, num_random_starts=0)
             self.assertTrue(result['success'])
             np.testing.assert_array_equal(estimated.strengths, [0.])
 
@@ -108,9 +108,9 @@ class NumericalChecks:
         modes = [[0, 4]]
         div = [Aberration(modes, [v]) for v in [-.1, .1]]
         args = (m, g, data, [0, .001], [0], modes, .01, div)
-        expected, info = cpu.optimize_aberration_3D(*args, mode='scalar', max_iterations=3, verbose=False, backend='cpu')
+        expected, info = cpu.optimize_aberration_3D(*args, mode='scalar', max_iterations=3, verbose=False, backend='cpu', num_random_starts=0)
         w = gpu.CUDAReconstruction(*args, mode='scalar', _xp=self.xp)
-        actual, other = w.optimize(max_iterations=3, verbose=False)
+        actual, other = w.optimize(max_iterations=3, verbose=False, num_random_starts=0)
         np.testing.assert_allclose(actual.strengths, expected.strengths, rtol=1e-7, atol=1e-9)
         self.assertEqual(other['success'], info['success'])
         np.testing.assert_allclose(other['loss'], info['loss'], rtol=1e-9)

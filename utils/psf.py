@@ -502,11 +502,13 @@ class Microscope():
         if len(diversities) != len(focal_z) or not all(isinstance(a, Aberration) for a in diversities):
             raise ValueError('Provide one diversity Aberration per acquired image.')
         kernel_grid = _convolution_grid(image.planes[0])
+        # Empty sample planes contribute exactly zero; avoid predicting their PSFs.
+        active_planes = [plane for plane in image.planes if np.any(plane.image_mask)]
         images = []
         for focus, diversity in zip(focal_z, diversities):
             total_aberration = aberration + diversity
             result = np.zeros_like(image.planes[0].image_mask, dtype=float)
-            for plane in image.planes:
+            for plane in active_planes:
                 grid = _grid_at_z(kernel_grid, plane.z_level - focus)
                 _, _, PSF = self.compute_PSF(grid, total_aberration, mode)
                 result += psf_convolve(plane.image_mask, PSF, norm=False)

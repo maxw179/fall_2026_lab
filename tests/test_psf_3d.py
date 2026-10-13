@@ -17,6 +17,16 @@ class VolumeTests(unittest.TestCase):
         mask[2, 3] = value
         return Image_Mask(grid, mask)
 
+    def test_empty_planes_skip_psfs_without_changing_the_image(self):
+        from unittest.mock import patch
+        active = self.plane(0)
+        volume = Image_Mask_3D([self.plane(-.001, 0), active, self.plane(.001, 0)])
+        expected = self.m.compute_image_3D(Image_Mask_3D([active]), self.a, [0, .001])[3]
+        with patch.object(self.m, 'compute_PSF', wraps=self.m.compute_PSF) as predict:
+            actual = self.m.compute_image_3D(volume, self.a, [0, .001])[3]
+        self.assertEqual(predict.call_count, 2)
+        np.testing.assert_array_equal(actual, expected)
+
     def test_container_validation(self):
         for planes in ([], [self.plane(0), self.plane(0)], [self.plane(np.nan)]):
             with self.assertRaises(ValueError):

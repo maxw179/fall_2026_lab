@@ -448,7 +448,7 @@ def plot_intensity_unnorm(x: np.ndarray, y: np.ndarray, intensity_map: np.ndarra
 
 
 """
-Plots multiple intensity maps, each normalized by its own maximum.
+Plots multiple intensity maps; normalize=False preserves a shared raw intensity scale.
 Params:
     axs (Sequence[Axes] | np.ndarray): axes on which to draw the maps
     x (np.ndarray): x coordinates [mm]
@@ -460,8 +460,10 @@ Returns:
     fig (Figure): figure containing the plot
     axs (np.ndarray): array of panel axes
 """
-def plot_many_intensity(axs: Sequence[Axes] | np.ndarray, x: np.ndarray, y: np.ndarray, intensity_maps: Sequence[np.ndarray], is_edge: bool=False, is_horizontal: bool=True, *, ax=None):
+def plot_many_intensity(axs: Sequence[Axes] | np.ndarray, x: np.ndarray, y: np.ndarray, intensity_maps: Sequence[np.ndarray], is_edge: bool=False, is_horizontal: bool=True, *, ax=None, normalize: bool=True, vmax: float | None=None):
     axs = np.ravel(axs if ax is None else ax)
+    shared_max = (1.0 if normalize else max(float(np.max(image)) for image in intensity_maps)) if vmax is None else vmax
+    shared_max = max(shared_max, np.finfo(float).tiny)
     for i, ax in enumerate(axs):
         if is_horizontal:
             if is_edge:
@@ -475,12 +477,12 @@ def plot_many_intensity(axs: Sequence[Axes] | np.ndarray, x: np.ndarray, y: np.n
                 ax.set_xlabel("x [mm]")
 
         ax.imshow(
-            _normalize_intensity(intensity_maps[i]).T,
+            (_normalize_intensity(intensity_maps[i]) if normalize else intensity_maps[i]).T,
             extent=_image_extent(x, y),
             origin="lower",
             aspect="equal",
             vmin=0,
-            vmax=1,
+            vmax=shared_max,
             cmap="Greys_r",
         )
         ax.grid(False)
@@ -736,8 +738,8 @@ def many_composite(
             if i == len(axs) - 1:
                 ax.set_xlabel("x [mm]")
 
-        rho = np.linspace(0, 1, 500)
-        phi = np.linspace(0, 2 * np.pi, 500)
+        rho = np.linspace(0, 1, 201)
+        phi = np.linspace(0, 2 * np.pi, 201)
         rho_grid, phi_grid = np.meshgrid(rho, phi, indexing="ij")
         theta_grid = np.arcsin(rho_grid * np.sin(alpha))
         z = z_maps[i](theta_grid, phi_grid)
@@ -764,6 +766,7 @@ def many_composite(
             rho,
             z,
             shading="auto",
+            cmap="plasma",
             vmin=vmin,
             vmax=vmax,
         )

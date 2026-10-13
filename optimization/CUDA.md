@@ -110,3 +110,32 @@ when timing asynchronous device work.
 Actual CUDA execution and speedup have not been validated on the development
 Mac. Small problems may run faster on CPU; double-precision throughput and memory
 capacity depend strongly on GPU model. No multi-GPU distribution is implemented.
+
+## Random initialization
+
+Every optimization screens 100 random aberrations by loss, alongside zero and
+any supplied initial point, then optimizes only the lowest-loss candidate.
+Gaussian coefficient directions use only the requested correction modes. Their
+RMS is normalized using `zernike_RMS` and sampled log-uniformly from 0.005 to
+0.50 waves. Screening computes no phase gradient or Hessian; the subsequent
+Newton solve still uses the exact Hessian.
+
+```python
+estimated, info = solver.optimize(
+    num_random_starts=100,
+    random_start_rms_range=(0.005, 0.50),
+    random_start_seed=0,
+)
+```
+
+These options also work in `optimize_aberration_3D`, on CPU and CUDA, for Newton
+and gradient methods. Set `num_random_starts=0` to use your supplied initial point
+(zero by default) directly. Seed 0 repeats the pool for matching modes and optics;
+use `None` for fresh random draws. `info["initialization"]` contains candidate
+strengths/losses, the selected point and screening time, or `None` when disabled.
+A separate progress bar counts completed screening loss evaluations, including
+zero and any supplied point. It closes before optimization begins. Set
+`show_initialization_progress=False` to hide it.
+Selecting a low-loss start does not guarantee a better wavefront RMS or a global
+minimum. The random-start benchmark disables this internal screening because it
+already screens its explicitly controlled pools.

@@ -37,3 +37,6 @@ optimization/performance/*.json
 *.synctex.gz
 # Original utility archive; extracted source is versioned.
 utils.zip
+
+*.json
+*.pdf

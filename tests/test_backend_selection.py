@@ -42,8 +42,8 @@ class BackendTests(unittest.TestCase):
             # Accepted fits and gradient arrays remain cached on the backend.
             with patch.object(workspace, '_propagate', side_effect=AssertionError('cache miss')):
                 workspace.loss_gradient(strengths)
-            a, info = workspace.optimize(method='gradient', max_iterations=3)
-            ref, other = expected.optimize(method='gradient', max_iterations=3)
+            a, info = workspace.optimize(method='gradient', max_iterations=3, num_random_starts=0)
+            ref, other = expected.optimize(method='gradient', max_iterations=3, num_random_starts=0)
             np.testing.assert_allclose(a.strengths, ref.strengths, rtol=2e-9)
             self.assertIsNone(info['hessian'])
             self.assertEqual(info['backend'], 'cuda')

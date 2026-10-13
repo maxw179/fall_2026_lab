@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from itertools import combinations_with_replacement
 
 import numpy as np
+from time import perf_counter
+from optimization._random_starts import random_aberration_starts
 
 from optimization._reconstruction_common import _derivative_geometry, _frequency_weights
 from utils.psf import Image_Mask, Image_Mask_3D, _convolution_grid, _grid_at_z, _z_array
@@ -54,9 +56,24 @@ class CPUReconstructionWorkspace:
                  sample_z_levels, modes, rho, diversities=None, mode="vector",
                  frequency_batch_size=4096, padding=None, psf_batch_size=8,
                  derivative_batch_size=8, reuse_svd=True, spatial_hessian=True,
-                 deduplicate_psfs=True, retain_fields=True, cache_last_fit=True, *, _xp=np):
+                 deduplicate_psfs=True, retain_fields=True, cache_last_fit=True, *, _xp=np, propagation="auto", fft_workers=1, cpu_workers=1):
         self.xp = xp = _xp
         self.backend = "cpu" if xp is np else "cuda"
+        if not isinstance(fft_workers, (int, np.integer)) or fft_workers < 1:
+            raise ValueError("fft_workers must be a positive integer.")
+        if not isinstance(cpu_workers, (int, np.integer)) or cpu_workers < 1:
+            raise ValueError("cpu_workers must be a positive integer.")
+        if xp is not np and cpu_workers != 1:
+            raise ValueError("cpu_workers applies only to CPU workspaces.")
+        self.cpu_workers = int(cpu_workers)
+        self.fft_workers = int(fft_workers)
+        if xp is np:
+            from scipy import fft
+            from functools import partial
+            self._rfft2 = partial(fft.rfft2, workers=self.fft_workers)
+            self._irfft2 = partial(fft.irfft2, workers=self.fft_workers)
+        else:
+            self._rfft2, self._irfft2 = xp.fft.rfft2, xp.fft.irfft2
         for name, value in [("frequency_batch_size", frequency_batch_size),
                             ("psf_batch_size", psf_batch_size),
                             ("derivative_batch_size", derivative_batch_size)]:
@@ -106,10 +123,11 @@ class CPUReconstructionWorkspace:
         self.data_norm = float(xp.linalg.norm(data))
         self.crop = (slice(None), slice(px, px + original_shape[0]),
                      slice(py, py + original_shape[1]))
-        self.observed = xp.fft.rfft2(data).reshape(len(self.focal_z), -1)
+        self.observed = self._rfft2(data).reshape(len(self.focal_z), -1)
         self.weights = xp.asarray(_frequency_weights(self.shape))
         self.rho = float(rho)
         self.order = microscope.N_order
+        self._alpha = float(microscope.alpha)
         self.frequency_batch_size = int(frequency_batch_size)
         self.psf_batch_size = int(psf_batch_size)
         self.derivative_batch_size = int(derivative_batch_size)
@@ -120,7 +138,8 @@ class CPUReconstructionWorkspace:
         self.cache_last_fit = bool(cache_last_fit)
         self._last_fit = None
 
-        geometry = _derivative_geometry(microscope, kernel_grid, self.modes, mode, xp=xp)
+        geometry = _derivative_geometry(microscope, kernel_grid, self.modes, mode, xp=xp, propagation=propagation,
+                                        fft_workers=self.fft_workers)
         self.amplitudes, mask, theta, phi, sz, basis, self._propagate = geometry
         self.amplitudes = xp.asarray(self.amplitudes)
         self.basis = xp.asarray(np.asarray(basis))
@@ -199,12 +218,20 @@ class CPUReconstructionWorkspace:
         periodic = self.xp.zeros((*leading, *self.shape), dtype=float)
         for sx, sy, dx, dy in self._wrap_blocks:
             periodic[..., dx, dy] += kernels[..., sx, sy]
-        return self.xp.fft.rfft2(periodic).reshape(*leading, len(self.weights))
+        return self._rfft2(periodic).reshape(*leading, len(self.weights))
+
+    def _notify_progress(self, **event):
+        callback = getattr(self, '_progress_callback', None)
+        if callback is not None:
+            callback(dict(backend=self.backend, method=self._progress_method,
+                          iteration=self._progress_iteration, **event))
 
     def _field_batches(self, strengths, first):
         common_phase = self.xp.exp(1j * self.xp.tensordot(self.xp.asarray(strengths), self.basis, axes=1))
         for start in range(0, len(self.groups), self.psf_batch_size):
             ids = range(start, min(start + self.psf_batch_size, len(self.groups)))
+            self._notify_progress(stage="propagation", completed=start,
+                                  total=len(self.groups))
             pupils = (self.fixed_phases[start:start + len(ids), None]
                       * common_phase * self.amplitudes[None])
             field = self._propagate(pupils)
@@ -249,7 +276,9 @@ class CPUReconstructionWorkspace:
         factors = []
         # A reduced SVD already has a complete right basis when K >= P.
         full = self.reuse_svd and len(self.sample_z) > len(self.focal_z)
-        for start in range(0, len(self.weights), self.frequency_batch_size):
+        self._notify_progress(stage="svd", completed=0, total=len(self.weights))
+
+        def solve_batch(start):
             stop = min(start + self.frequency_batch_size, len(self.weights))
             s = otfs[:, :, start:stop].transpose(2, 0, 1)
             d = self.observed[:, start:stop].T
@@ -257,10 +286,27 @@ class CPUReconstructionWorkspace:
             rank = singular.shape[1]
             projected = (u[:, :, :rank].conj().swapaxes(-1, -2) @ d[..., None])[..., 0]
             weighted = singular / (singular**2 + self.rho) * projected
-            estimated[:, start:stop] = (
-                vh[:, :rank].conj().swapaxes(-1, -2) @ weighted[..., None])[..., 0].T
-            if self.reuse_svd:
-                factors.append((start, stop, singular, vh))
+            fitted = (vh[:, :rank].conj().swapaxes(-1, -2) @ weighted[..., None])[..., 0].T
+            return start, stop, fitted, singular, vh
+
+        starts = range(0, len(self.weights), self.frequency_batch_size)
+        if self.cpu_workers > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            # Bounded groups prevent completed futures retaining all batches.
+            with ThreadPoolExecutor(max_workers=self.cpu_workers) as executor:
+                for offset in range(0, len(starts), self.cpu_workers):
+                    for start, stop, fitted, singular, vh in executor.map(
+                            solve_batch, starts[offset:offset + self.cpu_workers]):
+                        estimated[:, start:stop] = fitted
+                        if self.reuse_svd:
+                            factors.append((start, stop, singular, vh))
+        else:
+            for start in starts:
+                start, stop, fitted, singular, vh = solve_batch(start)
+                estimated[:, start:stop] = fitted
+                if self.reuse_svd:
+                    factors.append((start, stop, singular, vh))
+                self._notify_progress(stage="svd", completed=stop, total=len(self.weights))
         return estimated, factors
 
 
@@ -284,6 +330,52 @@ class CPUReconstructionWorkspace:
 
     def loss(self, strengths):
         return self._get_fit(self._strengths(strengths))[0].loss
+
+    def _parallel_points(self, strengths, workers, operation):
+        points = [self._strengths(point).copy() for point in strengths]
+        if not isinstance(workers, (int, np.integer)) or workers < 1:
+            raise ValueError("workers must be a positive integer.")
+        if workers == 1:
+            return [operation(self, point) for point in points]
+        if self.xp is not np:
+            raise ValueError("parallel evaluations are supported only on CPU.")
+        from concurrent.futures import ThreadPoolExecutor
+        from copy import copy
+        from threading import local
+        state = local()
+
+        def evaluate(point):
+            if not hasattr(state, 'workspace'):
+                state.workspace = copy(self)
+                state.workspace.clear_cache()
+                state.workspace.cpu_workers = 1
+            return operation(state.workspace, point)
+
+        with ThreadPoolExecutor(max_workers=int(workers)) as executor:
+            return list(executor.map(evaluate, points))
+
+    def losses(self, strengths, workers=1):
+        """Evaluate an ordered coefficient scan with independent thread-local fits.
+
+        CPU geometry/data are shared read-only. Each worker owns its mutable fit
+        cache. Parallelism multiplies fit memory; use BLAS threads=1 and
+        cpu_workers=1 to avoid nested thread pools. CUDA scans use workers=1.
+        """
+        return np.asarray(self._parallel_points(
+            strengths, workers, lambda workspace, point: workspace.loss(point)))
+
+    def optimize_starts(self, initial_strengths, workers=1, **options):
+        """Run independent full optimizations, returning results in start order.
+
+        Uses the same exact-Hessian Newton method by default. Choose the final
+        result yourself using its objective and convergence diagnostics. No
+        acquisition data or geometry is rebuilt between starting points.
+        """
+        if 'initial_strengths' in options:
+            raise ValueError("Provide starting points as the first argument.")
+        options.setdefault('verbose', False)
+        return self._parallel_points(initial_strengths, workers,
+            lambda workspace, point: workspace.optimize(initial_strengths=point, **options))
 
     def loss_gradient(self, strengths):
         """Return loss and the analytic envelope gradient without Hessian work.
@@ -326,13 +418,15 @@ class CPUReconstructionWorkspace:
                 for k, p in self.groups[group]:
                     correlation_f[b] += fit.residual[k] * fit.estimated[p].conj()
             if self.spatial_hessian:
-                correlation = self.xp.fft.irfft2(correlation_f.reshape(
+                correlation = self._irfft2(correlation_f.reshape(
                     len(ids), self.shape[0], self.shape[1]//2 + 1), s=self.shape)
                 correlation = correlation[:, ix[:, None], iy[None, :]]
             first_factor = self.order * intensity**(self.order - 1)
             second_factor = (self.order*(self.order - 1)*intensity**(self.order - 2)
                              if self.order != 1 else None)
             for start in range(0, len(self.pairs), self.derivative_batch_size):
+                self._notify_progress(stage="second_derivatives", completed=start,
+                                      total=len(self.pairs))
                 pairs = self.pairs[start:start + self.derivative_batch_size]
                 j, l = np.asarray(pairs).T
                 second_fields = self._propagate(
@@ -368,6 +462,8 @@ class CPUReconstructionWorkspace:
         # object-response contractions, which allocate frequency-batch arrays.
         del records
         for batch, start in enumerate(range(0, len(self.weights), self.frequency_batch_size)):
+            self._notify_progress(stage="hessian_response", completed=start,
+                                  total=len(self.weights))
             stop = min(start + self.frequency_batch_size, len(self.weights))
             sl = slice(start, stop)
             s = fit.otfs[:, :, sl].transpose(2, 0, 1)
@@ -397,14 +493,14 @@ class CPUReconstructionWorkspace:
     def estimate_sample(self, strengths, return_info=False):
         """Return the cropped real sample, with optional padded-fit diagnostics."""
         fit = self._get_fit(self._strengths(strengths))[0]
-        result = self.xp.fft.irfft2(fit.estimated.reshape(
+        result = self._irfft2(fit.estimated.reshape(
             len(self.sample_z), self.shape[0], self.shape[1]//2 + 1), s=self.shape)
         sample = Image_Mask_3D([
             Image_Mask(_grid_at_z(self.grid, level), plane)
             for level, plane in zip(self.sample_z, self._host(result[self.crop]))])
         if not return_info:
             return sample
-        residual = self.xp.fft.irfft2((-fit.residual).reshape(
+        residual = self._irfft2((-fit.residual).reshape(
             len(self.focal_z), self.shape[0], self.shape[1]//2 + 1), s=self.shape)
         # Padding adds only zeros, so padded and measured data norms are equal.
         info = dict(padding=self.padding, padded_shape=self.shape, loss=fit.loss, backend=self.backend,
@@ -445,12 +541,19 @@ class CPUReconstructionWorkspace:
 
     def optimize(self, initial_strengths=None, max_iterations=50,
                  gradient_tolerance=1e-6, strength_tolerance=1e-8,
-                 max_step=0.1, max_backtracks=20, verbose=False, method='newton'):
+                 max_step=0.1, max_backtracks=20, verbose=False, method='newton',
+                 on_iteration=None, on_progress=None, *, num_random_starts=100,
+                 random_start_rms_range=(0.005, 0.50), random_start_seed=0,
+                 show_initialization_progress=True):
         """Fit Zernike strengths with Newton or gradient steps and backtracking.
 
         Newton scaling, curvature steps and stopping rules match the reference.
         Gradient mode uses steepest descent, computes no Hessian, and stops on
         the scaled gradient tolerance alone. Both reuse accepted loss fits.
+        By default, screen 100 random phases by loss before optimizing once.
+        Zero and the supplied initial point are also candidates. Set
+        num_random_starts=0 to use only the supplied point (zero by default).
+        show_initialization_progress controls the separate loss-screening bar.
         """
         if method not in ('newton', 'gradient'):
             raise ValueError("method must be 'newton' or 'gradient'.")
@@ -465,76 +568,154 @@ class CPUReconstructionWorkspace:
                 raise ValueError(f"{name} must be finite and strictly positive.")
         strengths = self._strengths(np.zeros(len(self.modes)) if initial_strengths is None
                                    else initial_strengths).copy()
+        # Validate screening parameters even when screening is disabled.
+        if isinstance(num_random_starts, (bool, np.bool_)) or not isinstance(num_random_starts, (int, np.integer)) or num_random_starts < 0:
+            raise ValueError('num_random_starts must be a nonnegative integer.')
+        bounds = np.asarray(random_start_rms_range, dtype=float)
+        if bounds.shape != (2,) or not np.all(np.isfinite(bounds)) or not 0 < bounds[0] <= bounds[1]:
+            raise ValueError('random_start_rms_range must satisfy 0 < lower <= upper, in waves.')
         self.clear_cache()
-        history, scale, success = [], None, False
-        message = "Maximum iterations reached."
-        for iteration in range(max_iterations + 1):
-            if method == 'newton':
-                loss, gradient, hessian = self.derivatives(strengths)
-            else:
-                loss, gradient = self.loss_gradient(strengths)
-                hessian = None
-            if not (np.isfinite(loss) and np.all(np.isfinite(gradient))
-                    and (hessian is None or np.all(np.isfinite(hessian)))):
-                raise FloatingPointError("Nonfinite loss or derivatives during optimization.")
-            if scale is None:
-                scale = max(abs(loss), np.finfo(float).tiny)
-            history.append(dict(iteration=iteration, loss=loss, strengths=strengths.copy()))
-            if verbose:
-                print(f"Iteration {iteration}: loss={loss:.10e}, strengths (waves)="
-                      f"{np.array2string(strengths, precision=8)}", flush=True)
-            g = gradient / scale
-            stationary = np.linalg.norm(g, ord=np.inf) <= gradient_tolerance
-            if method == 'gradient':
-                if stationary:
-                    success, message = True, "Gradient tolerance satisfied; curvature not evaluated."
-                    break
-                if iteration == max_iterations:
-                    break
-                direction = -g
-                direction *= min(1.0, max_step / np.max(abs(direction)))
-                directions = [direction]
-            else:
-                h = (hessian + hessian.T) / (2*scale)
-                eigenvalues, eigenvectors = np.linalg.eigh(h)
-                curvature_tol = 1e-10 * max(1.0, float(np.max(abs(eigenvalues))))
-                if stationary and eigenvalues[0] >= -curvature_tol:
-                    success, message = True, "Gradient and curvature tolerances satisfied."
-                    break
-                if iteration == max_iterations:
-                    break
-                if stationary:
-                    direction = eigenvectors[:, 0]
-                    direction *= max_step / np.max(abs(direction))
-                    directions = [direction, -direction]
+        previous_callback = getattr(self, '_progress_callback', None)
+        self._progress_callback = on_progress
+        self._progress_method = method
+        try:
+            screening = None
+            if num_random_starts:
+                started = perf_counter()
+                random_points = random_aberration_starts(
+                    self.modes, self._alpha, num_random_starts, bounds, random_start_seed)
+                candidates = [strengths]
+                if np.any(strengths):
+                    candidates.append(np.zeros(len(self.modes)))
+                candidates.extend(random_points)
+                candidates = np.asarray(candidates)
+                previous_reuse = self.reuse_svd
+                self._progress_iteration = 0
+                self.reuse_svd = False
+                screening_progress = None
+                try:
+                    if show_initialization_progress:
+                        from tqdm.auto import tqdm
+                        screening_progress = tqdm(total=len(candidates),
+                                                  desc="Random-start loss evaluations",
+                                                  unit="eval", leave=False)
+                    losses = []
+                    for index, point in enumerate(candidates):
+                        if on_progress is not None:
+                            on_progress(dict(stage='initialization', iteration=0,
+                                             completed=index, total=len(candidates),
+                                             backend=self.backend, method=method))
+                        losses.append(self.loss(point))
+                        if screening_progress is not None:
+                            screening_progress.update(1)
+                    losses = np.asarray(losses)
+                    valid = np.isfinite(losses)
+                    if not np.any(valid):
+                        raise FloatingPointError('No finite loss among initialization candidates.')
+                    selected = int(np.argmin(np.where(valid, losses, np.inf)))
+                    strengths = candidates[selected].copy()
+                    screening = dict(num_random_starts=int(num_random_starts),
+                                     rms_range=tuple(bounds), seed=random_start_seed,
+                                     selected_index=selected, selected_strengths=strengths.copy(),
+                                     candidate_strengths=candidates, candidate_losses=losses,
+                                     seconds=perf_counter()-started)
+                    if on_progress is not None:
+                        on_progress(dict(stage='initialization', iteration=0,
+                                         completed=len(candidates), total=len(candidates),
+                                         backend=self.backend, method=method))
+                    if verbose:
+                        print(f'Initialization: screened {num_random_starts} random phases; '
+                              f'selected candidate {selected}, loss={losses[selected]:.6e}', flush=True)
+                finally:
+                    if screening_progress is not None:
+                        screening_progress.close()
+                    self.reuse_svd = previous_reuse
+                    # Screening fits lack retained Hessian SVD factors.
+                    self.clear_cache()
+            history, scale, success = [], None, False
+            message = "Maximum iterations reached."
+            for iteration in range(max_iterations + 1):
+                self._progress_iteration = iteration
+                if on_progress is not None:
+                    on_progress(dict(stage="derivatives", iteration=iteration,
+                                     backend=self.backend, method=method))
+                if method == 'newton':
+                    loss, gradient, hessian = self.derivatives(strengths)
                 else:
-                    floor = max(1e-8, 1e-6*float(np.max(abs(eigenvalues))))
-                    direction = -eigenvectors @ ((eigenvectors.T @ g)
-                                                 / np.maximum(eigenvalues, floor))
+                    loss, gradient = self.loss_gradient(strengths)
+                    hessian = None
+                if not (np.isfinite(loss) and np.all(np.isfinite(gradient))
+                        and (hessian is None or np.all(np.isfinite(hessian)))):
+                    raise FloatingPointError("Nonfinite loss or derivatives during optimization.")
+                if scale is None:
+                    scale = max(abs(loss), np.finfo(float).tiny)
+                history.append(dict(iteration=iteration, loss=loss, strengths=strengths.copy()))
+                if verbose:
+                    print(f"Iteration {iteration}: loss={loss:.10e}, strengths (waves)="
+                          f"{np.array2string(strengths, precision=8)}", flush=True)
+                g = gradient / scale
+                stationary = np.linalg.norm(g, ord=np.inf) <= gradient_tolerance
+                if on_iteration is not None:
+                    on_iteration(dict(iteration=iteration, loss=loss,
+                                      strengths=strengths.copy(),
+                                      scaled_gradient_inf=float(np.linalg.norm(g, ord=np.inf)),
+                                      backend=self.backend, method=method))
+                if method == 'gradient':
+                    if stationary:
+                        success, message = True, "Gradient tolerance satisfied; curvature not evaluated."
+                        break
+                    if iteration == max_iterations:
+                        break
+                    direction = -g
                     direction *= min(1.0, max_step / np.max(abs(direction)))
                     directions = [direction]
-            accepted = False
-            for backtrack in range(max_backtracks):
-                for direction in directions:
-                    step = direction * 0.5**backtrack
-                    trial = strengths + step
-                    trial_loss = self.loss(trial)
-                    if (np.isfinite(trial_loss) and trial_loss < loss
-                            and (trial_loss-loss)/scale <= 1e-4*min(float(g @ step), 0.0)):
-                        accepted = True
+                else:
+                    h = (hessian + hessian.T) / (2*scale)
+                    eigenvalues, eigenvectors = np.linalg.eigh(h)
+                    curvature_tol = 1e-10 * max(1.0, float(np.max(abs(eigenvalues))))
+                    if stationary and eigenvalues[0] >= -curvature_tol:
+                        success, message = True, "Gradient and curvature tolerances satisfied."
                         break
-                if accepted:
+                    if iteration == max_iterations:
+                        break
+                    if stationary:
+                        direction = eigenvectors[:, 0]
+                        direction *= max_step / np.max(abs(direction))
+                        directions = [direction, -direction]
+                    else:
+                        floor = max(1e-8, 1e-6*float(np.max(abs(eigenvalues))))
+                        direction = -eigenvectors @ ((eigenvectors.T @ g)
+                                                     / np.maximum(eigenvalues, floor))
+                        direction *= min(1.0, max_step / np.max(abs(direction)))
+                        directions = [direction]
+                accepted = False
+                for backtrack in range(max_backtracks):
+                    for direction in directions:
+                        step = direction * 0.5**backtrack
+                        trial = strengths + step
+                        if on_progress is not None:
+                            on_progress(dict(stage="line_search", iteration=iteration,
+                                             backtrack=backtrack, backend=self.backend,
+                                             method=method))
+                        trial_loss = self.loss(trial)
+                        if (np.isfinite(trial_loss) and trial_loss < loss
+                                and (trial_loss-loss)/scale <= 1e-4*min(float(g @ step), 0.0)):
+                            accepted = True
+                            break
+                    if accepted:
+                        break
+                if not accepted:
+                    message = "Line search failed to find a decreasing step."
                     break
-            if not accepted:
-                message = "Line search failed to find a decreasing step."
-                break
-            if np.max(abs(step)) <= strength_tolerance:
-                message = "Step below strength tolerance before convergence."
-                break
-            strengths = trial
-        if verbose:
-            print(f"Stopped: {message}", flush=True)
-        return Aberration(self.modes.copy(), strengths), dict(
-            success=success, message=message, iterations=len(history)-1,
-            loss=loss, gradient=gradient, hessian=hessian, history=history,
-            method=method, backend=self.backend)
+                if np.max(abs(step)) <= strength_tolerance:
+                    message = "Step below strength tolerance before convergence."
+                    break
+                strengths = trial
+            if verbose:
+                print(f"Stopped: {message}", flush=True)
+            return Aberration(self.modes.copy(), strengths), dict(
+                success=success, message=message, iterations=len(history)-1,
+                loss=loss, gradient=gradient, hessian=hessian, history=history,
+                method=method, backend=self.backend, initialization=screening)
+        finally:
+            self._progress_callback = previous_callback

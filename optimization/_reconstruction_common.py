@@ -45,7 +45,7 @@ class _KernelTransform:
         return np.fft.rfft2(self.periodic).ravel()
 
 
-def _derivative_geometry(microscope, grid, modes, mode, *, xp=np):
+def _derivative_geometry(microscope, grid, modes, mode, *, xp=np, propagation="auto", fft_workers=1):
     """Prepare phase-independent pupil geometry for an acquisition workspace."""
     from utils.rw import (get_bfp_grid, bfp_coord_convert,
                           gaussian_amplitude_s_perp, strength_angular)
@@ -56,6 +56,13 @@ def _derivative_geometry(microscope, grid, modes, mode, *, xp=np):
     pupil = np.zeros_like(x, dtype=complex)
     gauss = gaussian_amplitude_s_perp(m.mag, m.w_0, m.f, m.n, np.sqrt(sx**2 + sy**2))
     pupil[mask] = gauss[mask]
+    # Optional fixed pupil transmission is shared by forward and inverse optics.
+    transmission = getattr(m, 'pupil_transmission', None)
+    if transmission is not None:
+        weights = np.asarray(transmission(theta, phi, mask), dtype=float)
+        if weights.shape != mask.shape or not np.all(np.isfinite(weights)) or np.any(weights < 0):
+            raise ValueError('Pupil transmission must be finite, nonnegative, and match the pupil grid.')
+        pupil *= weights
     if mode == 'scalar':
         pupils = pupil[None]
         scale = (sx[1, 0]-sx[0, 0]) * (sy[0, 1]-sy[0, 0])
@@ -67,13 +74,43 @@ def _derivative_geometry(microscope, grid, modes, mode, *, xp=np):
     else:
         raise ValueError("mode must be 'scalar' or 'vector'.")
     x, y = grid.get_xy()
-    Ax = np.exp(1j*m.k*np.outer(x, sx[:, 0]))
-    Ay = np.exp(1j*m.k*np.outer(sy[0, :], y))
+    if propagation not in ('auto', 'dense', 'zoom'):
+        raise ValueError("propagation must be 'auto', 'dense', or 'zoom'.")
+    # Whole-solver benchmarks vary with batch sizes and BLAS implementation.
+    # Keep the proven dense default; ZoomFFT is explicitly selectable.
+    use_zoom = xp is np and propagation == 'zoom'
+    if propagation == 'zoom' and xp is not np:
+        raise ValueError("zoom propagation is a CPU backend option.")
+    if use_zoom:
+        from scipy.signal import ZoomFFT
+        axes = [(x, sx[:, 0]), (y, sy[0, :])]
+        transforms = []
+        for target, source in axes:
+            # ZoomFFT computes exp(-i*frequency*j). The physical exponent
+            # has the opposite sign, with source[j] = source[0] + j*spacing.
+            source_step = source[1] - source[0]
+            if not (np.allclose(np.diff(source), source_step, rtol=1e-12, atol=1e-15)
+                    and (len(target) < 3 or np.allclose(np.diff(target), target[1]-target[0],
+                                                       rtol=1e-12, atol=1e-15))):
+                raise ValueError("zoom propagation requires uniformly sampled axes.")
+            frequencies = -m.k*source_step*np.asarray(target)
+            # A half-open range also handles a one-point output axis.
+            step = frequencies[1]-frequencies[0] if len(target) > 1 else 0.
+            transforms.append(ZoomFFT(len(source),
+                [frequencies[0], frequencies[0]+len(target)*step],
+                len(target), fs=2*np.pi))
+        phase = scale * np.exp(1j*m.k*x*sx[0, 0])[:, None] * np.exp(1j*m.k*y*sy[0, 0])[None, :]
 
-    Ax, Ay = xp.asarray(Ax), xp.asarray(Ay)
+        def propagate(p):
+            from scipy.fft import set_workers
+            with set_workers(fft_workers):
+                return transforms[1](transforms[0](p, axis=-2), axis=-1) * phase
+    else:
+        Ax = xp.asarray(np.exp(1j*m.k*np.outer(x, sx[:, 0])))
+        Ay = xp.asarray(np.exp(1j*m.k*np.outer(sy[0, :], y)))
 
-    def propagate(p):
-        return scale * (Ax @ p @ Ay)
+        def propagate(p):
+            return scale * (Ax @ p @ Ay)
 
     # A unit strength constructs 2*pi*Z, including the waves-to-radians factor.
     basis = []

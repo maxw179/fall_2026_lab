@@ -112,7 +112,7 @@ class CPUWorkspaceTests(unittest.TestCase):
              patch('numpy.linalg.eigh', side_effect=AssertionError('Curvature checked')):
             result, info = production.optimize_aberration_3D(
                 None, None, None, [0], [0], workspace.modes, 1,
-                method='gradient', max_iterations=100, verbose=False)
+                method='gradient', max_iterations=100, verbose=False, num_random_starts=0)
         self.assertTrue(info['success'], info['message'])
         self.assertIsNone(info['hessian'])
         self.assertEqual(info['method'], 'gradient')
@@ -126,7 +126,7 @@ class CPUWorkspaceTests(unittest.TestCase):
     def test_invalid_optimization_method(self):
         with self.assertRaisesRegex(ValueError, 'method'):
             production.optimize_aberration_3D(
-                None, None, None, [0], [0], [[0, 4]], 1, method='unknown')
+                None, None, None, [0], [0], [[0, 4]], 1, method='unknown', num_random_starts=0)
 
     def test_public_estimator_diagnostics_and_private_tuple(self):
         for optical_mode in ["scalar", "vector"]:
@@ -240,10 +240,10 @@ class CPUWorkspaceTests(unittest.TestCase):
         expected, expected_info = reference.optimize_aberration_3D(
             modes=truth.modes, verbose=False, **common)
         workspace = CPUReconstructionWorkspace(modes=truth.modes, **common)
-        actual, actual_info = workspace.optimize()
+        actual, actual_info = workspace.optimize(num_random_starts=0)
         with patch("optimization.reconstruction._workspace", wraps=production._workspace) as factory:
             public, public_info = production.optimize_aberration_3D(
-                modes=truth.modes, verbose=False, **common)
+                modes=truth.modes, verbose=False, **common, num_random_starts=0)
         self.assertEqual(factory.call_count, 1)
         self.assertTrue(public_info["success"], public_info["message"])
         np.testing.assert_allclose(public.strengths, expected.strengths, atol=1e-6)
@@ -265,7 +265,7 @@ class CPUWorkspaceTests(unittest.TestCase):
 
         with patch.object(workspace, "derivatives", side_effect=derivatives), \
              patch.object(workspace, "loss", side_effect=lambda s: derivatives(s)[0]):
-            result, info = workspace.optimize(gradient_tolerance=1e-9)
+            result, info = workspace.optimize(gradient_tolerance=1e-9, num_random_starts=0)
         self.assertTrue(info["success"], info["message"])
         self.assertAlmostEqual(abs(result.strengths[0]), .2, places=6)
 
