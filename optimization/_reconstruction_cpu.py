@@ -35,7 +35,7 @@ class CPUReconstructionWorkspace:
     """Reuse geometry, batched propagation and object fits across Newton steps.
 
     The three improvement switches support controlled benchmark ablations.
-    ``reuse_svd`` retains right singular bases for the exact object-response
+    ``reuse_svd`` retains left/right singular bases for the exact object-response
     solve, including null-space directions when sample planes outnumber images.
     ``spatial_hessian`` replaces only the second-PSF-derivative FFT contractions.
     ``deduplicate_psfs`` shares exact (defocus, diversity phase) combinations.
@@ -43,6 +43,8 @@ class CPUReconstructionWorkspace:
     Memory tradeoff: retained SVD factors occupy approximately
     frequencies * sample_planes * min(images, sample_planes) complex numbers,
     or frequencies * sample_planes**2 when a full right basis is needed.
+    Retained left bases add frequencies * images * min(images, sample_planes)
+    complex numbers for stable residual/Hessian contractions.
     ``retain_fields`` also retains the unique PSFs' base/first fields during one
     derivative call. Disable it to recompute those fields using smaller memory.
     Frequency and propagation batches limit temporary arrays, not these caches.
@@ -273,6 +275,7 @@ class CPUReconstructionWorkspace:
 
     def _solve(self, otfs):
         estimated = self.xp.empty((len(self.sample_z), len(self.weights)), dtype=complex)
+        residual = self.xp.empty_like(self.observed)
         factors = []
         # A reduced SVD already has a complete right basis when K >= P.
         full = self.reuse_svd and len(self.sample_z) > len(self.focal_z)
@@ -287,7 +290,16 @@ class CPUReconstructionWorkspace:
             projected = (u[:, :, :rank].conj().swapaxes(-1, -2) @ d[..., None])[..., 0]
             weighted = singular / (singular**2 + self.rho) * projected
             fitted = (vh[:, :rank].conj().swapaxes(-1, -2) @ weighted[..., None])[..., 0].T
-            return start, stop, fitted, singular, vh
+            # D - S F loses relative accuracy when the fit nearly interpolates D.
+            # In the left singular basis, residual coefficients are explicitly
+            # rho/(sigma^2+rho) times the data coefficients. For K<=P the left
+            # basis is complete, so no subtraction of near-equal arrays is needed.
+            left = u[:, :, :rank]
+            residual_coefficients = self.rho / (singular**2 + self.rho) * projected
+            remaining = (left @ residual_coefficients[..., None])[..., 0]
+            if len(self.focal_z) > rank:
+                remaining += d - (left @ projected[..., None])[..., 0]
+            return start, stop, fitted, remaining.T, left, singular, vh
 
         starts = range(0, len(self.weights), self.frequency_batch_size)
         if self.cpu_workers > 1:
@@ -295,19 +307,21 @@ class CPUReconstructionWorkspace:
             # Bounded groups prevent completed futures retaining all batches.
             with ThreadPoolExecutor(max_workers=self.cpu_workers) as executor:
                 for offset in range(0, len(starts), self.cpu_workers):
-                    for start, stop, fitted, singular, vh in executor.map(
+                    for start, stop, fitted, remaining, left, singular, vh in executor.map(
                             solve_batch, starts[offset:offset + self.cpu_workers]):
                         estimated[:, start:stop] = fitted
+                        residual[:, start:stop] = remaining
                         if self.reuse_svd:
-                            factors.append((start, stop, singular, vh))
+                            factors.append((start, stop, left, singular, vh))
         else:
             for start in starts:
-                start, stop, fitted, singular, vh = solve_batch(start)
+                start, stop, fitted, remaining, left, singular, vh = solve_batch(start)
                 estimated[:, start:stop] = fitted
+                residual[:, start:stop] = remaining
                 if self.reuse_svd:
-                    factors.append((start, stop, singular, vh))
+                    factors.append((start, stop, left, singular, vh))
                 self._notify_progress(stage="svd", completed=stop, total=len(self.weights))
-        return estimated, factors
+        return estimated, residual, factors
 
 
     def _get_fit(self, strengths, first=False, retain_fields=None):
@@ -318,8 +332,7 @@ class CPUReconstructionWorkspace:
         if retain_fields is not None:
             build_options['retain_fields'] = retain_fields
         otfs, d_otfs, records = self._build_otfs(strengths, **build_options)
-        estimated, factors = self._solve(otfs)
-        residual = self.observed - self.xp.einsum("kpf,pf->kf", otfs, estimated)
+        estimated, residual, factors = self._solve(otfs)
         loss = float(self.xp.sum(self.weights * (self.xp.sum(abs(residual)**2, axis=0)
                      + self.rho * self.xp.sum(abs(estimated)**2, axis=0))))
         fit = _Fit(strengths.copy(), otfs, estimated, residual, loss, factors)
@@ -470,20 +483,35 @@ class CPUReconstructionWorkspace:
             ds = d_otfs[:, :, :, sl].transpose(3, 0, 1, 2)
             f, residual = fit.estimated[:, sl].T, fit.residual[:, sl].T
             q = self.xp.einsum("bmkp,bp->bmk", ds, f)
-            c = (self.xp.einsum("bmkp,bk->bpm", ds.conj(), residual)
-                 - self.xp.einsum("bkp,bmk->bpm", s.conj(), q))
+            a = self.xp.einsum("bmkp,bk->bpm", ds.conj(), residual)
             if self.reuse_svd:
-                _, _, singular, vh = fit.factors[batch]
+                _, _, left, singular, vh = fit.factors[batch]
             else:
-                _, singular, vh = self._svd(s, full_matrices=True)
+                left, singular, vh = self._svd(s, full_matrices=True)
+                left = left[:, :, :singular.shape[1]]
             denom = self.xp.full((len(s), len(self.sample_z)), self.rho)
             denom[:, :singular.shape[1]] += singular**2
-            response = vh.conj().swapaxes(-1, -2) @ ((vh @ c) / denom[..., None])
+            # Expand q^H q - c^H (S^H S+rho I)^-1 c in singular coordinates,
+            # where c=a-S^H q. This avoids subtracting two order-one terms to
+            # obtain order-rho curvature, and avoids spurious S^H q components
+            # in the right null space being magnified by 1/rho.
+            rank = singular.shape[1]
+            t = left.conj().swapaxes(-1, -2) @ q.swapaxes(1, 2)
+            z = vh @ a
+            t_regularized = t * self.xp.sqrt(self.rho / denom[:, :rank, None])
+            t_cross = t * (singular / denom[:, :rank])[:, :, None]
+            z_regularized = z / self.xp.sqrt(denom[..., None])
             w = self.weights[sl]
             gradient -= 2*self.xp.real(self.xp.einsum("b,bk,bmk->m", w, residual.conj(), q))
             hessian += 2*self.xp.real(
-                self.xp.einsum("b,bmk,bnk->mn", w, q.conj(), q)
-                - self.xp.einsum("b,bpm,bpn->mn", w, c.conj(), response))
+                self.xp.einsum("b,bpm,bpn->mn", w, t_regularized.conj(), t_regularized)
+                + self.xp.einsum("b,bpm,bpn->mn", w, z[:, :rank].conj(), t_cross)
+                + self.xp.einsum("b,bpm,bpn->mn", w, t_cross.conj(), z[:, :rank])
+                - self.xp.einsum("b,bpm,bpn->mn", w, z_regularized.conj(), z_regularized))
+            if len(self.focal_z) > rank:
+                q_remaining = q.swapaxes(1, 2) - left @ t
+                hessian += 2*self.xp.real(self.xp.einsum(
+                    'b,bkm,bkn->mn', w, q_remaining.conj(), q_remaining))
         hessian = (hessian + hessian.T) / 2
         if self.cache_last_fit:
             fit.derivatives = (gradient.copy(), hessian.copy())
@@ -518,8 +546,8 @@ class CPUReconstructionWorkspace:
         if fit is not None:
             fit_bytes = sum(a.nbytes for a in [fit.strengths, fit.otfs,
                             fit.estimated, fit.residual])
-            fit_bytes += sum(singular.nbytes + vh.nbytes
-                             for _, _, singular, vh in fit.factors)
+            fit_bytes += sum(left.nbytes + singular.nbytes + vh.nbytes
+                             for _, _, left, singular, vh in fit.factors)
             if fit.derivatives is not None:
                 fit_bytes += sum(a.nbytes for a in fit.derivatives)
             if fit.gradient is not None:

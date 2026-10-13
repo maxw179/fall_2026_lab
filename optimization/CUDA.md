@@ -73,6 +73,14 @@ reduced Hessian contractions, inverse FFTs, and residual diagnostics. Host setup
 constructs geometry and Zernike bases once. The small optimizer eigensolve and
 line-search decisions run on the host.
 
+Residuals and reduced-Hessian response terms are evaluated in singular-value
+coordinates. For K<=P this avoids subtracting nearly equal observed/predicted
+arrays; expanding the curvature contraction also avoids cancellation between
+large terms and artificial right-null-space response. This matters when rho is
+very small relative to operator power. Both CPU and CUDA use these algebraically
+equivalent formulas, with unchanged objective and double precision. Retained
+left bases add 16*Q*K*min(K,P) bytes when reuse_svd=True.
+
 The GPU shares the optimized CPU workspace algorithm: exact repeated PSFs are
 merged, second derivatives contract in the spatial domain without M-squared OTF
 storage, SVD factors are reused for the object response, and accepted line-search
@@ -129,7 +137,15 @@ Hessian and optimizer agreement on the real acquisition.
 The default remains svd_method="direct". Portable NumPy checks validate the
 factorization, extreme scales, rank deficiency, full null-space response, cached
 fits, optical derivatives and finite differences, Newton and random screening.
-The QR path has not yet been executed or timed on actual CUDA hardware.
+On the first Bouchet CUDA test run, factorization, scale/rank checks, null-space
+response and optimizer checks passed. Optical parity failed in the very weak
+regularization test: the shared residual/curvature subtractions amplified
+roundoff, even with the direct-SVD fallback. The singular-coordinate formulas
+above resolve that issue in portable checks without relaxing comparison
+tolerances. Added checks compare nearly interpolated loss/gradient/Hessian
+against a closed-form rational objective down to rho=1e-18, and optical finite
+differences now include the weak-regularization case. The updated solver still
+needs a CUDA rerun. No QR-path CUDA speedup has been measured yet.
 
 On Bouchet, after pushing/pulling these changes and within a GPU allocation:
 

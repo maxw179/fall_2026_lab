@@ -104,6 +104,53 @@ class QRChecks:
         np.testing.assert_allclose(other['initialization']['candidate_losses'],
                                    info['initialization']['candidate_losses'], rtol=2e-8)
 
+    def test_nearly_interpolated_fit_against_closed_form(self):
+        # Two diagonal measurement channels and 31 exact right-null directions.
+        # A linear S(a) gives a rational loss whose derivatives are known without
+        # SVD or finite differences, even when rho is below machine epsilon.
+        m = Microscope(1, .0013, 1.333, 1.05, 7.2, 4, 3.5, 15.12, 16)
+        grid = Arbitrary_Grid(.003, .004, 4, 5, 0, 0, 0)
+        point = np.array([.07])
+        slopes = np.array([1., -.4])
+        channel = np.array([1., 1.7]) + slopes * point[0]
+        data = np.array([1.+.2j, .4-1.3j])
+        for method in ('direct', 'qr'):
+            for rho in (.03, 1e-12, 1e-18):
+                with self.subTest(method=method, rho=rho):
+                    w = CUDAReconstruction(m, grid, np.zeros((2, 4, 5)), [0, .001],
+                        np.linspace(0, .002, 33), [[0, 4]], rho,
+                        svd_method=method, _xp=self.xp)
+                    frequencies = len(w.weights)
+                    w.observed = self.xp.broadcast_to(self.xp.asarray(data[:, None]),
+                                                      (2, frequencies)).copy()
+
+                    def build(strengths, first=False, include_base=True, **kwargs):
+                        otfs = self.xp.zeros((2, 33, frequencies), dtype=complex)
+                        otfs[0, 0] = 1. + strengths[0]
+                        otfs[1, 1] = 1.7 - .4 * strengths[0]
+                        derivatives = None
+                        if first:
+                            derivatives = self.xp.zeros((1, 2, 33, frequencies), dtype=complex)
+                            derivatives[0, 0, 0] = 1.
+                            derivatives[0, 1, 1] = -.4
+                        return otfs if include_base else None, derivatives, None
+
+                    w._build_otfs = build
+                    w._second_psf_hessian = lambda *args: self.xp.zeros((1, 1))
+                    denominator = channel**2 + rho
+                    total_weight = float(self.host(w.weights).sum())
+                    target_loss = total_weight * np.sum(rho * abs(data)**2 / denominator)
+                    target_gradient = total_weight * np.sum(
+                        -2 * rho * abs(data)**2 * channel * slopes / denominator**2)
+                    target_hessian = total_weight * np.sum(
+                        2 * rho * abs(data)**2 * slopes**2 * (3*channel**2-rho) / denominator**3)
+                    w.loss(point)  # Verify the cached-fit route as well.
+                    loss, gradient, hessian = w.derivatives(point)
+                    for actual, target in [(loss, target_loss), (gradient[0], target_gradient),
+                                           (hessian[0, 0], target_hessian)]:
+                        np.testing.assert_allclose(actual / target_loss, target / target_loss,
+                                                   rtol=2e-9, atol=2e-12)
+
     def test_optical_parity_cached_fit_and_finite_difference(self):
         m = Microscope(3, .0013, 1.333, 1.05, 7.2, 4, 3.5, 15.12, 16)
         grid = Arbitrary_Grid(.003, .004, 4, 5, 0, 0, 0)
@@ -120,9 +167,10 @@ class QRChecks:
             expected = ref.derivatives(a.strengths)
             fast.loss(a.strengths)  # Retained full right basis must survive the cache hit.
             actual = fast.derivatives(a.strengths)
-            for value, target in zip(actual, expected):
+            case = f'K={k}, P={p}, reuse_svd={reuse}, rho_factor={rho_factor}'
+            for name, value, target in zip(('loss', 'gradient', 'hessian'), actual, expected):
                 np.testing.assert_allclose(np.asarray(value)/expected[0], np.asarray(target)/expected[0],
-                                           rtol=2e-8, atol=2e-9)
+                                           rtol=2e-8, atol=2e-9, err_msg=f'{case}; {name}')
             sample = fast.estimate_sample(a.strengths).image_mask
             target = ref.estimate_sample(a.strengths).image_mask
             np.testing.assert_allclose(sample, target, rtol=2e-8, atol=2e-9*np.max(abs(target)))
@@ -130,12 +178,14 @@ class QRChecks:
                 self.assertGreater(fast.svd_counts['qr'], 0)
             else:
                 self.assertGreater(fast.svd_counts['direct'], 0)
-            if rho_factor == 1:
-                delta = np.array([1e-5, 0])
-                numerical = (fast.derivatives(a.strengths+delta)[1]
-                             - fast.derivatives(a.strengths-delta)[1])/(2e-5)
-                np.testing.assert_allclose(numerical/expected[0], actual[2][:, 0]/expected[0],
-                                           rtol=3e-5, atol=2e-6)
+            for j in range(2):
+                delta = np.eye(2)[j]*1e-5
+                plus = fast.derivatives(a.strengths+delta)
+                minus = fast.derivatives(a.strengths-delta)
+                np.testing.assert_allclose((plus[0]-minus[0])/(2e-5*expected[0]),
+                    actual[1][j]/expected[0], rtol=3e-5, atol=2e-6, err_msg=f'{case}; gradient FD')
+                np.testing.assert_allclose((plus[1]-minus[1])/(2e-5*expected[0]),
+                    actual[2][:, j]/expected[0], rtol=3e-5, atol=2e-6, err_msg=f'{case}; Hessian FD')
 
 
 class PortableQRTests(QRChecks, unittest.TestCase):
