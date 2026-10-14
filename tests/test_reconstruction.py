@@ -13,9 +13,9 @@ def fixed_kernel_otfs(kernel):
     def build(workspace, strengths, first=False, include_base=True):
         if first:
             raise AssertionError("Synthetic kernel fixture has no phase derivatives.")
-        otf = workspace._transform(kernel)
+        otf = workspace._transform(workspace.xp.asarray(kernel))
         shape = (len(workspace.focal_z), len(workspace.sample_z), len(workspace.weights))
-        return np.broadcast_to(otf, shape).copy(), None, None
+        return workspace.xp.broadcast_to(otf, shape).copy(), None, None
     return build
 
 

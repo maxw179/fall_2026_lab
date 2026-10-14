@@ -144,8 +144,12 @@ roundoff, even with the direct-SVD fallback. The singular-coordinate formulas
 above resolve that issue in portable checks without relaxing comparison
 tolerances. Added checks compare nearly interpolated loss/gradient/Hessian
 against a closed-form rational objective down to rho=1e-18, and optical finite
-differences now include the weak-regularization case. The updated solver still
-needs a CUDA rerun. No QR-path CUDA speedup has been measured yet.
+differences now include the weak-regularization case. On the subsequent Bouchet
+CUDA run, all numerical QR/CUDA checks passed, including the previously failing
+optical parity and independent closed-form test. The full suite had two errors
+in older synthetic-kernel fixtures that mixed NumPy arrays into the auto-selected
+CUDA workspace; those fixtures now create arrays on the selected backend and
+need a GPU rerun. No QR-path CUDA speedup has been measured yet.
 
 On Bouchet, after pushing/pulling these changes and within a GPU allocation:
 
