@@ -113,7 +113,7 @@ def stack_feedback(simulator, grid, sample_z_levels, focal_positions,
                    on_update=None, on_progress=None,
                    diversity_decay=1.0, min_diversity_strength=0.0,
                    diversity_modes=None, diversity_strategy="cycle", diversity_schedule=None,
-                   reuse_acquisitions=False):
+                   reuse_acquisitions=False, optimizer=None):
     """Reacquire a diverse stack and fit the residual after every SLM update.
 
     Each fit uses the optimizer's initialization screening for the current residual. Even an iteration-limited fit can provide a useful
@@ -133,8 +133,14 @@ def stack_feedback(simulator, grid, sample_z_levels, focal_positions,
     one shared object. Historical known phases are diversity + acquisition SLM
     - current SLM, so the unknown remains the current residual. Image budgets
     count only new acquisitions; old images retain their original noise draws.
+    optimizer optionally supplies a callable with optimize_aberration_3D's
+    arguments and return value, for workspace configuration or external timing.
     """
     _validate_control(image_budget, gain, max_update)
+    if optimizer is None:
+        optimizer = reconstruction.optimize_aberration_3D
+    if not callable(optimizer):
+        raise ValueError("optimizer must be callable.")
     if diversity_strategy not in ('cycle', 'joint'):
         raise ValueError("diversity_strategy must be 'cycle' or 'joint'.")
     positions = np.asarray(focal_positions, dtype=float)
@@ -236,7 +242,7 @@ def stack_feedback(simulator, grid, sample_z_levels, focal_positions,
                 iteration_callback(diagnostic)
 
             fit_kwargs["on_iteration"] = report_fit_iteration
-        estimated, info = reconstruction.optimize_aberration_3D(
+        estimated, info = optimizer(
             microscope=simulator.microscope, grid=grid, images=fit_images,
             focal_z_levels=fit_focal_z, sample_z_levels=sample_z_levels,
             modes=simulator.modes, rho=rho, diversities=fit_diversities,

@@ -17,6 +17,7 @@ def animate_reconstruction(info: dict, modes, microscope, *,
                            interval: float = 500, threshold: float | None = None,
                            percentile: float = 98, stride: int = 1,
                            res: int = 150, dpi: int = 100, ax=None,
+                           precomputed_samples: Sequence[Image_Mask_3D] | None = None,
                            **reconstruction_kwargs):
     """Animate recorded optimizer iterates using zernike_plot and plot_sample_3D.
 
@@ -25,6 +26,8 @@ def animate_reconstruction(info: dict, modes, microscope, *,
     sample_z_levels, rho, diversities, and any nondefault mode/padding settings
     as reconstruction_kwargs. Objects are refitted once per selected iterate;
     rendering and replay do not rerun reconstruction. No optimization is run.
+    precomputed_samples optionally supplies one saved object per history entry,
+    avoiding all object refits (for example when replaying a GPU run on a Mac).
 
     ax optionally supplies two playback axes (phase, object).
     Returns (aberration_animation, object_animation), two FuncAnimations.
@@ -70,8 +73,14 @@ def animate_reconstruction(info: dict, modes, microscope, *,
         if strengths.shape != (len(modes),) or not np.all(np.isfinite(strengths)):
             raise ValueError("History strengths must match modes and be finite.")
         aberrations.append(Aberration(modes, strengths))
-    samples = [estimate_sample_3D(microscope=microscope, aberration=a,
-                                  **reconstruction_kwargs) for a in aberrations]
+    if precomputed_samples is None:
+        samples = [estimate_sample_3D(microscope=microscope, aberration=a,
+                                     **reconstruction_kwargs) for a in aberrations]
+    else:
+        if (len(precomputed_samples) != len(history) or
+                not all(isinstance(s, Image_Mask_3D) for s in precomputed_samples)):
+            raise ValueError("Provide one precomputed Image_Mask_3D per history entry.")
+        samples = [precomputed_samples[i] for i in indices]
     if threshold is None:
         threshold = float(np.percentile(samples[-1].image_mask, percentile))
     visible = [s.image_mask[s.image_mask > threshold] for s in samples]
@@ -94,7 +103,7 @@ def animate_reconstruction(info: dict, modes, microscope, *,
     phase_frames, object_frames = [], []
     with plt.ioff():
         for entry, aberration, sample in zip(entries, aberrations, samples):
-            title = f"Iteration {entry['iteration']}\nLoss = {entry['loss']:.3e}"
+            title = entry.get('title', f"Iteration {entry['iteration']}\nLoss = {entry['loss']:.3e}")
             fig, _ = zernike_plot(aberration.construct_map(microscope.alpha),
                                   microscope.alpha, res=res, show=False)
             phase_frames.append(snapshot(fig, title))

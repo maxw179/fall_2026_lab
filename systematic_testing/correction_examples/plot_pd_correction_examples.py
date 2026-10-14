@@ -17,8 +17,14 @@ DEFAULT_CASES = [(0.15, 100., 0), (0.15, 100., 1), (0.30, 5., 2), (0.30, 100., 2
 
 
 def plot_correction_example(data, initial_rms, snr, trial, *, noisy=False, acquired_planes=False,
-                            sample=None, example_title=None):
-    """Return a four-panel figure; noise is a new illustration, not archived acquisition."""
+                            sample=None, example_title=None, precomputed_images=None,
+                            microscope=None, grid=None, use_tex=True):
+    """Return the shared four-state figure with optional saved acquisition images.
+
+    precomputed_images has shape (focus, four correction states, x, y), and
+    bypasses forward simulation/noise. Explicit geometry supports a higher
+    image resolution without changing the plotting style.
+    """
     ri = np.flatnonzero(np.isclose(data['initial_rms'], initial_rms))
     si = np.flatnonzero(np.isclose(data['target_snr'], snr))
     if len(ri) != 1 or len(si) != 1:
@@ -29,19 +35,29 @@ def plot_correction_example(data, initial_rms, snr, trial, *, noisy=False, acqui
     commands = data['slm_strengths'][ri, si, trial]
     if commands.shape[0] != 3 or not np.all(np.isfinite(commands)):
         raise ValueError('Example requires three completed correction loops.')
-    microscope = psf.Microscope(N_order=3, lambd=1.3e-3, n=1.333,
+    if microscope is None:
+        microscope = psf.Microscope(N_order=3, lambd=1.3e-3, n=1.333,
                                num_apt=1.05, f=7.2, mag=4, w_0=3.5,
                                L_bfp=15.12, grid_bfp=32)
-    grid = psf.Centered_Square_Grid(L_ffp=0.0065, grid_ffp=32, z_level=0)
-    if sample is None:
+    if grid is None:
+        grid = psf.Centered_Square_Grid(L_ffp=0.0065, grid_ffp=32, z_level=0)
+    if sample is None and precomputed_images is None:
         sample = psf.bead_img_3D(grid, data['sample_z'], [0], [0], [0], [0.001])
     # Commands already carry the negative correction sign and are cumulative.
     coefficients = data['truth_strengths'][ri, trial] + np.vstack([np.zeros(commands.shape[1]), commands])
     aberrations = [zernike.Aberration(data['modes'], c) for c in coefficients]
     focal_z = np.asarray(data["focal_positions"] if acquired_planes else [0.0])
-    images = np.array([microscope.compute_image_3D(
-        sample, a, focal_z, mode='vector', diversities=None)[3] for a in aberrations])
-    images = images.transpose(1, 0, 2, 3)  # focus rows, correction-state columns
+    if precomputed_images is None:
+        images = np.array([microscope.compute_image_3D(
+            sample, a, focal_z, mode='vector', diversities=None)[3] for a in aberrations])
+        images = images.transpose(1, 0, 2, 3)  # focus rows, correction-state columns
+    else:
+        if noisy:
+            raise ValueError('Saved precomputed images already specify their noise realization.')
+        images = np.asarray(precomputed_images)
+        if (images.shape != (len(focal_z), 4, grid.grid_ffp_x, grid.grid_ffp_y)
+                or not np.all(np.isfinite(images))):
+            raise ValueError('precomputed_images must match the focal positions, four states and lateral grid.')
     if noisy:
         exposure = float(data['exposures'][ri, si, trial])
         rng = np.random.default_rng(np.random.SeedSequence([int(data['noise_seed']), ri, si, trial, 9902]))
@@ -51,7 +67,7 @@ def plot_correction_example(data, initial_rms, snr, trial, *, noisy=False, acqui
     maps = [a.construct_map(microscope.alpha) for a in aberrations]
     phase_limit = 2 * np.pi
     with plt.style.context('bmh'), plt.rc_context({
-        'text.usetex': True, 'font.size': 9 if acquired_planes else 12, 'figure.dpi': 300,
+        'text.usetex': use_tex, 'font.size': 9 if acquired_planes else 12, 'figure.dpi': 300,
         'figure.figsize': [548 / 72, 390 / 72],
     }):
         nr = len(focal_z)

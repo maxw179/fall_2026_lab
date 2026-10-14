@@ -10,18 +10,27 @@ from utils import zernike
 HISTORY_PATH = ROOT / "systematic_testing/rms_snr_sweep/results/pd_rms_snr_sweep_random100_iteration_histories.npz"
 
 
-def plot_iteration_rms(data, initial_rms, snr, trial, *, histories=None):
+def plot_iteration_rms(data, initial_rms, snr, trial, *, histories=None,
+                       time_axis=False, use_tex=True):
+    """Plot sweep histories with the established example style.
+
+    time_axis uses saved core_elapsed_seconds and loop_end_core_seconds while
+    retaining the same layout, colors, boundary annotations and typography.
+    use_tex=False is an explicit option for render tests without LaTeX.
+    """
     if histories is None:
         with np.load(HISTORY_PATH, allow_pickle=False) as archive:
-            return plot_iteration_rms(data, initial_rms, snr, trial, histories=archive)
+            return plot_iteration_rms(data, initial_rms, snr, trial, histories=archive,
+                                      time_axis=time_axis, use_tex=use_tex)
     ri = int(np.flatnonzero(np.isclose(data['initial_rms'], initial_rms))[0])
     si = int(np.flatnonzero(np.isclose(data['target_snr'], snr))[0])
     steps = np.asarray(data['optimizer_steps'][ri, si, trial], dtype=int)
     residual = np.r_[initial_rms, data['residual_rms'][ri, si, trial]]
     if not np.all(np.isfinite(residual)):
         raise ValueError('All correction loops must be complete.')
-    boundaries = np.r_[0, np.cumsum(steps)]
-    with plt.style.context('bmh'), plt.rc_context({'text.usetex': True, 'font.size': 9, 'figure.dpi': 300}):
+    boundaries = (np.asarray(data['loop_end_core_seconds'][ri, si, trial]) if time_axis
+                  else np.r_[0, np.cumsum(steps)])
+    with plt.style.context('bmh'), plt.rc_context({'text.usetex': use_tex, 'font.size': 9, 'figure.dpi': 300}):
         fig, ax = plt.subplots(figsize=(6, 6))
         alpha = np.arcsin(1.05 / 1.333)
         maximum_error = max(residual)
@@ -39,7 +48,8 @@ def plot_iteration_rms(data, initial_rms, snr, trial, *, histories=None):
             errors = np.array([zernike.zernike_RMS_difference(
                 zernike.Aberration(data['modes'], estimate), truth, alpha)
                 for estimate in histories['strengths'][selected]])
-            ax.plot(boundaries[loop] + iterations, errors, '.-',
+            xs = histories['core_elapsed_seconds'][selected] if time_axis else boundaries[loop] + iterations
+            ax.plot(xs, errors, '.-',
                     label=f'Loop {loop+1} estimation error', markersize=4)
             maximum_error = max(maximum_error, float(errors.max()))
         ax.scatter(boundaries, residual, marker='x', color='black', s=45,
@@ -51,12 +61,16 @@ def plot_iteration_rms(data, initial_rms, snr, trial, *, histories=None):
             ax.annotate(label, (boundary, 1), xycoords=('data', 'axes fraction'),
                         xytext=(4, -6), textcoords='offset points', rotation=90,
                         ha='left', va='top', fontsize=7)
-        ax.set(xlabel='Cumulative optimizer iterations', ylabel='RMS error [waves]',
-)
+        ax.set(xlabel='Cumulative core computation time [s]' if time_axis else 'Cumulative optimizer iterations',
+               ylabel='RMS error [waves]')
         ax.set_ylim(bottom=0, top=maximum_error*1.25)
-        ax.set_xlim(-1, max(1, boundaries[-1])+1)
-        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-        ax.xaxis.set_major_formatter(StrMethodFormatter('{x:.0f}'))
+        if time_axis:
+            margin = .025*max(float(boundaries[-1]), 1e-9)
+            ax.set_xlim(-margin, boundaries[-1]+margin)
+        else:
+            ax.set_xlim(-1, max(1, boundaries[-1])+1)
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax.xaxis.set_major_formatter(StrMethodFormatter('{x:.0f}'))
         ax.legend(loc='upper center', bbox_to_anchor=(.5, 1.16), ncol=2, fontsize=8)
         fig.subplots_adjust(left=.15, right=.95, bottom=.13, top=.84)
     return fig, ax

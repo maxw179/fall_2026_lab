@@ -9,6 +9,7 @@ Each experiment folder contains its notebooks and helpers, with numerical output
 | [noise_robustness](noise_robustness/) | Camera models, noise experiments and acquisition comparisons |
 | [random_start_benchmark](random_start_benchmark/) | Random-start replay and closed-loop benchmarks |
 | [bead_count_sweep](bead_count_sweep/) | Completed bead-count sweep, correction examples and optimizer histories |
+| [gpu_demo](gpu_demo/) | Timed three-loop cumulative AO on Bouchet, portable object histories and local animations |
 | [booth](booth/) | Booth correction experiment |
 | [correction_comparison](correction_comparison/) | Stack feedback versus Booth |
 | [regularization](regularization/) | Rho, SNR, sampling and object-size studies |
