@@ -149,7 +149,18 @@ CUDA run, all numerical QR/CUDA checks passed, including the previously failing
 optical parity and independent closed-form test. The full suite had two errors
 in older synthetic-kernel fixtures that mixed NumPy arrays into the auto-selected
 CUDA workspace; those fixtures now create arrays on the selected backend and
-need a GPU rerun. No QR-path CUDA speedup has been measured yet.
+need a GPU rerun.
+
+The subsequent user-reported B200 benchmark (128x128 image/pupil, 24 images,
+40 planes, two modes, QR, PSF batch 8, frequency batch 4096, BLAS threads=1)
+passed numerical parity. Median CPU/CUDA times were 3.951/0.245 seconds for loss,
+6.682/0.279 for loss/gradient, and 11.226/0.370 for loss/gradient/exact Hessian.
+A single full optimization including 100 random starts took 400.197 seconds on
+CPU and 25.586 on B200; both converged to matching coefficients/loss. History
+had two states (one accepted Newton update). Screening alone took 24.828 GPU
+seconds, approximately 97% of optimization time. These are warmed synthetic
+two-mode timings, not measurements of a real many-mode acquisition. Those runs
+precede the loss-only candidate screening implementation below.
 
 On Bouchet, after pushing/pulling these changes and within a GPU allocation:
 
@@ -227,3 +238,81 @@ zero and any supplied point. It closes before optimization begins. Set
 Selecting a low-loss start does not guarantee a better wavefront RMS or a global
 minimum. The random-start benchmark disables this internal screening because it
 already screens its explicitly controlled pools.
+
+## Batched loss-only candidate screening
+
+CUDA random initialization now uses a separate scoring path. The default
+screening_method="linear" batches four candidates, while CPU screening remains
+serial. The Gaussian directions, RMS range, seed, zero/supplied candidates and
+number of random points are unchanged. Newton/backtracking still use the exact
+SVD-based fit and Hessian.
+
+For K<=P, write T=S/sqrt(rho). Solve the smaller KxK system
+(I+T T^H)y=D, then evaluate the minimized objective as Re(D^H y). The benchmark's
+24x40 object fit becomes a 24x24 regularized linear solve during screening.
+This computes the same minimized loss without materializing the fitted object,
+right singular basis or Hessian factors. For K>P use the smaller primal system
+(I+T^H T)x=T^H D and score ||D-Tx||^2+||x||^2. CuPy's batched linear solve avoids
+the iterative SVD work for eligible small matrices.
+
+Forming a Gram matrix can amplify rounding errors when regularization is weak.
+The linear route is used only when sum(abs(S)**2)/rho <= 1e6 and the smaller
+system is within CuPy's batched solve size limit. Other frequencies use a stable
+SVD loss in singular coordinates, including left-null-space residuals. Candidates
+within 4e-8 relative of the best fast score are rechecked with the canonical loss
+before choosing the starting point. No point is dropped and no physical
+parameter, Fourier frequency or precision is changed.
+
+```python
+solver = reconstruction.ReconstructionWorkspace(
+    microscope, grid, images, focal_z_levels, sample_z_levels,
+    modes, rho, diversities=diversities, backend="cuda", svd_method="qr",
+    screening_method="linear", screening_batch_size=4,
+)
+estimated, info = solver.optimize(num_random_starts=100, random_start_seed=0)
+print(info["initialization"])
+# Optional ordered scoring of an externally supplied coefficient pool:
+scores = solver.screen_losses(candidate_strengths)
+```
+
+CUDA-only workspace options screening_method="serial" and "svd" provide the
+original full-fit baseline and batched SVD-only scores. Batch size 1 isolates
+the loss-only algorithm from candidate batching. Larger batches multiply base
+OTF storage (about 0.507 GB per candidate in the 128/24/40 example). A conservative
+estimate of free GPU/pool memory caps the requested batch size; it is not a
+peak-memory guarantee. OOM/device errors propagate. The workspace is still
+single-device and cannot be called concurrently from multiple threads.
+
+info['initialization'] additionally reports method, effective batch_size,
+refined_candidates and linear_frequencies/svd_fallback_frequencies. Progress
+counts completed candidates in chunks. screen_losses clears fit caches and
+restores reuse_svd even when scoring or progress callbacks fail.
+
+Portable checks compare linear/SVD scores against full fits, ill-conditioned
+operators at the guard boundary, small rho and left null spaces, zero-data and
+near-tied candidates, seeded selection/optimizer results, callback progress and
+failure cleanup. Actual new-path CUDA speedup has not been measured yet.
+
+The isolated benchmark compares identical 101-point pools using original serial
+GPU fitting and loss-only batches 1, 4, and 8. It checks every score and selected
+index against serial GPU fitting, checks three points on CPU, warms each path,
+interleaves repeats and synchronizes GPU work. It avoids repeating the roughly
+400-second CPU optimization just to test GPU screening.
+
+```sh
+REQUIRE_CUDA=1 python -m unittest discover -s tests -p test_candidate_screening.py -v
+python -u -m optimization.performance.benchmark_screening --size 128 --pupil-size 128 --images 24 --planes 40 --random-starts 100 --candidate-batches 1 4 8 --repeats 3 > screening.json
+```
+
+For an unattended Bouchet run, submit from the updated repository root:
+
+```sh
+mkdir -p logs
+sbatch --qos=normal optimization/performance/bouchet_screening.sbatch
+```
+
+The script uses account pi_cr876 and any one H100/H200/B200, runs the new GPU
+checks first, and saves JSON/GPU/software/revision records in
+results/bouchet/screening/JOBID/. For full optimizer comparisons, the existing
+benchmark_cuda accepts --screening-method and --screening-batch-size; old
+behavior is reproducible with --screening-method serial.

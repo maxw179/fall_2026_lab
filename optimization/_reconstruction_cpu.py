@@ -344,6 +344,33 @@ class CPUReconstructionWorkspace:
     def loss(self, strengths):
         return self._get_fit(self._strengths(strengths))[0].loss
 
+    def _screen_candidates(self, candidates, on_completed=None):
+        """CPU baseline; CUDA overrides this with bounded candidate batches."""
+        self._last_screening_info = dict(method='serial', batch_size=1, refined_candidates=0)
+        losses = []
+        for index, point in enumerate(candidates):
+            losses.append(self.loss(point))
+            if on_completed is not None:
+                on_completed(index + 1)
+        return np.asarray(losses)
+
+    def screen_losses(self, strengths, *, on_completed=None):
+        """Score candidates in order, clearing fit caches and retaining no factors.
+
+        CPU execution is serial. CUDA supports batched loss-only screening.
+        on_completed receives the cumulative number of scored candidates.
+        The candidate pool is not changed; this method does not optimize it.
+        """
+        candidates = np.asarray([self._strengths(point).copy() for point in strengths])
+        previous_reuse = self.reuse_svd
+        self.clear_cache()
+        self.reuse_svd = False
+        try:
+            return self._screen_candidates(candidates, on_completed)
+        finally:
+            self.reuse_svd = previous_reuse
+            self.clear_cache()
+
     def _parallel_points(self, strengths, workers, operation):
         points = [self._strengths(point).copy() for point in strengths]
         if not isinstance(workers, (int, np.integer)) or workers < 1:
@@ -627,16 +654,23 @@ class CPUReconstructionWorkspace:
                         screening_progress = tqdm(total=len(candidates),
                                                   desc="Random-start loss evaluations",
                                                   unit="eval", leave=False)
-                    losses = []
-                    for index, point in enumerate(candidates):
+                    completed = 0
+
+                    def report_completed(count):
+                        nonlocal completed
                         if on_progress is not None:
                             on_progress(dict(stage='initialization', iteration=0,
-                                             completed=index, total=len(candidates),
+                                             completed=count, total=len(candidates),
                                              backend=self.backend, method=method))
-                        losses.append(self.loss(point))
                         if screening_progress is not None:
-                            screening_progress.update(1)
-                    losses = np.asarray(losses)
+                            screening_progress.update(count - completed)
+                        completed = count
+
+                    if on_progress is not None:
+                        on_progress(dict(stage='initialization', iteration=0,
+                                         completed=0, total=len(candidates),
+                                         backend=self.backend, method=method))
+                    losses = self.screen_losses(candidates, on_completed=report_completed)
                     valid = np.isfinite(losses)
                     if not np.any(valid):
                         raise FloatingPointError('No finite loss among initialization candidates.')
@@ -646,11 +680,8 @@ class CPUReconstructionWorkspace:
                                      rms_range=tuple(bounds), seed=random_start_seed,
                                      selected_index=selected, selected_strengths=strengths.copy(),
                                      candidate_strengths=candidates, candidate_losses=losses,
-                                     seconds=perf_counter()-started)
-                    if on_progress is not None:
-                        on_progress(dict(stage='initialization', iteration=0,
-                                         completed=len(candidates), total=len(candidates),
-                                         backend=self.backend, method=method))
+                                     seconds=perf_counter()-started,
+                                     **self._last_screening_info)
                     if verbose:
                         print(f'Initialization: screened {num_random_starts} random phases; '
                               f'selected candidate {selected}, loss={losses[selected]:.6e}', flush=True)

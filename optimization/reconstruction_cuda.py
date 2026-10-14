@@ -28,15 +28,34 @@ class CUDAReconstruction(CPUReconstructionWorkspace):
     memory; first derivative OTFs and retained fit factors still scale with the
     full acquisition. ``svd_method='qr'`` opts into batched QR reduction for
     eligible rectangular operators; direct SVD remains the default and the
-    weak-regularization fallback. ``_xp`` is for portable numerical tests only.
+    weak-regularization fallback. Screening defaults to bounded loss-only
+    linear solves; ``screening_method='serial'`` restores the original scoring
+    path. ``_xp`` is for portable numerical tests only.
     """
-    def __init__(self, *args, _xp=None, svd_method='direct', **kwargs):
+    def __init__(self, *args, _xp=None, svd_method='direct',
+                 screening_method='linear', screening_batch_size=4, **kwargs):
         if svd_method not in ('direct', 'qr'):
             raise ValueError("svd_method must be 'direct' or 'qr'.")
         self.svd_method = svd_method
         self.svd_counts = dict(qr=0, direct=0)
+        if screening_method not in ('linear', 'svd', 'serial'):
+            raise ValueError("screening_method must be 'linear', 'svd', or 'serial'.")
+        if (isinstance(screening_batch_size, (bool, np.bool_))
+                or not isinstance(screening_batch_size, (int, np.integer))
+                or screening_batch_size < 1):
+            raise ValueError('screening_batch_size must be a positive integer.')
+        self.screening_method = screening_method
+        self.screening_batch_size = int(screening_batch_size)
         super().__init__(*args, _xp=_cupy() if _xp is None else _xp, **kwargs)
         self.backend = 'cuda'
+        self._screen_group_batches = []
+        for start in range(0, len(self.groups), self.psf_batch_size):
+            stop = min(start + self.psf_batch_size, len(self.groups))
+            pairs = [(k, p, group-start) for group in range(start, stop)
+                     for k, p in self.groups[group]]
+            k, p, group = np.asarray(pairs).T
+            self._screen_group_batches.append((start, stop, self.xp.asarray(k),
+                                               self.xp.asarray(p), self.xp.asarray(group)))
 
     def _svd(self, matrices, full_matrices):
         rows, columns = matrices.shape[-2:]
@@ -73,6 +92,116 @@ class CUDAReconstruction(CPUReconstructionWorkspace):
             return u, singular, vh
         self.svd_counts['direct'] += len(matrices)
         return super()._svd(matrices, full_matrices)
+
+    def _screen_batch_size(self, count):
+        requested = min(self.screening_batch_size, count)
+        if self.xp is np or count == 0:
+            return requested
+        # Allow reuse of released pool allocations. This is a conservative
+        # array estimate, not a peak-memory guarantee; allocation errors propagate.
+        free, _ = self.xp.cuda.runtime.memGetInfo()
+        available = free + self.xp.get_default_memory_pool().free_bytes()
+        k, p, q = len(self.focal_z), len(self.sample_z), len(self.weights)
+        rank = min(k, p)
+        frequency = 16*self.frequency_batch_size*(4*k*p + 4*rank**2 + k**2 + p**2)
+        pupil = int(np.prod(self.amplitudes.shape[-2:]))
+        kernel = int(np.prod(self.kernel_shape))
+        field = self.psf_batch_size * (16*len(self.amplitudes)*(pupil+kernel)
+                    + 8*kernel + 24*int(np.prod(self.shape)))
+        per_candidate = 16*k*p*q + frequency + field + 16*pupil
+        return min(requested, max(1, int(.5*available/max(per_candidate, 1))))
+
+    def _screen_otfs(self, candidates):
+        """Propagate a candidate axis and scatter each PSF batch in one assignment."""
+        xp = self.xp
+        phase = xp.exp(1j*xp.tensordot(xp.asarray(candidates), self.basis, axes=1))
+        otfs = xp.empty((len(candidates), len(self.focal_z), len(self.sample_z),
+                         len(self.weights)), dtype=complex)
+        for start, stop, k, p, group in self._screen_group_batches:
+            pupils = (phase[:, None, None] * self.fixed_phases[None, start:stop, None]
+                      * self.amplitudes[None, None])
+            field = self._propagate(pupils)
+            intensity = xp.sum(abs(field)**2, axis=2)
+            transformed = self._transform(intensity**self.order)
+            otfs[:, k, p] = transformed[:, group]
+        return otfs
+
+    def _screen_frequency_losses(self, matrices, data, counts):
+        from optimization._screening import linear_screening_loss, spectral_screening_loss
+        xp = self.xp
+        if self.screening_method == 'svd':
+            counts['svd_fallback_frequencies'] += len(matrices)
+            return spectral_screening_loss(matrices, data, self.rho, self._svd, xp)
+        bound = xp.sum(abs(matrices)**2, axis=(1, 2))/self.rho
+        safe = self._host(bound <= 1e6)
+        if xp is not np:
+            from cupy.cublas import get_batched_gesv_limit
+            if min(matrices.shape[-2:]) > get_batched_gesv_limit():
+                safe[:] = False
+        counts['linear_frequencies'] += int(np.count_nonzero(safe))
+        counts['svd_fallback_frequencies'] += int(np.count_nonzero(~safe))
+
+        def linear(s, d):
+            if xp is np:
+                return linear_screening_loss(s, d, self.rho, xp)
+            import cupyx
+            with cupyx.errstate(linalg='raise'):
+                return linear_screening_loss(s, d, self.rho, xp)
+
+        if np.all(safe):
+            return linear(matrices, data)
+        if not np.any(safe):
+            return spectral_screening_loss(matrices, data, self.rho, self._svd, xp)
+        values = xp.empty(len(matrices))
+        good, fallback = xp.asarray(np.flatnonzero(safe)), xp.asarray(np.flatnonzero(~safe))
+        values[good] = linear(matrices[good], data[good])
+        values[fallback] = spectral_screening_loss(
+            matrices[fallback], data[fallback], self.rho, self._svd, xp)
+        return values
+
+    def _screen_candidates(self, candidates, on_completed=None):
+        if self.screening_method == 'serial':
+            return super()._screen_candidates(candidates, on_completed)
+        xp = self.xp
+        count = len(candidates)
+        batch_size = self._screen_batch_size(count)
+        counts = dict(linear_frequencies=0, svd_fallback_frequencies=0)
+        scores = np.empty(count)
+        for start in range(0, count, max(batch_size, 1)):
+            stop = min(start + batch_size, count)
+            current = candidates[start:stop]
+            otfs = self._screen_otfs(current)
+            totals = xp.zeros(len(current))
+            for frequency in range(0, len(self.weights), self.frequency_batch_size):
+                sl = slice(frequency, frequency + self.frequency_batch_size)
+                bins = len(self.weights[sl])
+                s = otfs[..., sl].transpose(0, 3, 1, 2).reshape(
+                    -1, len(self.focal_z), len(self.sample_z))
+                d = xp.broadcast_to(self.observed[:, sl].T,
+                    (len(current), bins, len(self.focal_z))).reshape(-1, len(self.focal_z))
+                losses = self._screen_frequency_losses(s, d, counts).reshape(len(current), bins)
+                totals += xp.sum(losses * self.weights[sl], axis=1)
+            scores[start:stop] = self._host(totals)
+            del otfs, s, d, losses, totals
+            if stop < count and on_completed is not None:
+                on_completed(stop)
+
+        # Gram solves have a bounded conditioning risk, but near-tied scores
+        # should not change seed selection merely through reduction roundoff.
+        # Recheck the winner and every close challenger using canonical loss.
+        valid = np.isfinite(scores)
+        finalists = np.empty(0, dtype=int)
+        if np.any(valid):
+            best = np.min(scores[valid])
+            tolerance = 4e-8*max(abs(best), np.finfo(float).tiny)
+            finalists = np.flatnonzero(valid & (scores <= best + tolerance))
+            for index in finalists:
+                scores[index] = self.loss(candidates[index])
+        self._last_screening_info = dict(method=self.screening_method, batch_size=batch_size,
+                                        refined_candidates=len(finalists), **counts)
+        if count and on_completed is not None:
+            on_completed(count)
+        return scores
 
     def derivatives(self, strengths):
         loss, gradient, hessian = super().derivatives(strengths)

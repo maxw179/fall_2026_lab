@@ -83,9 +83,12 @@ def main():
     parser.add_argument('--max-iterations', type=int, default=5)
     parser.add_argument('--random-starts', type=int, default=0,
                         help='Screen this many starts during the optional full optimizer measurement.')
+    parser.add_argument('--screening-method', choices=('linear', 'svd', 'serial'), default='linear')
+    parser.add_argument('--screening-batch-size', type=int, default=4)
     options = parser.parse_args()
     sizes = ('size', 'pupil_size', 'images', 'planes', 'repeats', 'modes',
-             'psf_batch_size', 'derivative_batch_size', 'frequency_batch_size', 'max_iterations')
+             'psf_batch_size', 'derivative_batch_size', 'frequency_batch_size', 'max_iterations',
+             'screening_batch_size')
     if any(getattr(options, key) < 1 for key in sizes):
         parser.error('all sizes and repeats must be positive')
     if options.random_starts < 0:
@@ -104,11 +107,15 @@ def main():
                    derivative_batch_size=options.derivative_batch_size,
                    frequency_batch_size=options.frequency_batch_size)
     workspaces = {'cpu': CPUReconstructionWorkspace(*args, **batches)}
+    screening_options = dict(screening_method=options.screening_method,
+                             screening_batch_size=options.screening_batch_size)
     if options.cuda_svd == 'compare':
-        workspaces.update({f'cuda_{method}': CUDAReconstruction(*args, svd_method=method, **batches)
+        workspaces.update({f'cuda_{method}': CUDAReconstruction(*args, svd_method=method,
+                           **batches, **screening_options)
                            for method in ('direct', 'qr')})
     else:
-        workspaces['cuda'] = CUDAReconstruction(*args, svd_method=options.cuda_svd, **batches)
+        workspaces['cuda'] = CUDAReconstruction(*args, svd_method=options.cuda_svd,
+                                               **batches, **screening_options)
     synchronize = cp.cuda.get_current_stream().synchronize
     # Check multiple phases before timing, including derivatives from a cached loss fit.
     print('Checking CPU/CUDA loss, sample, gradient and Hessian agreement...', file=sys.stderr, flush=True)
@@ -183,7 +190,10 @@ def main():
             optimizations[backend] = dict(seconds=perf_counter()-start, strengths=estimated.strengths.tolist(),
                 loss=info['loss'], success=bool(info['success']), message=info['message'],
                 history_steps=len(info['history']),
-                initialization_seconds=info['initialization']['seconds'] if info['initialization'] else 0.)
+                initialization_seconds=info['initialization']['seconds'] if info['initialization'] else 0.,
+                initialization_method=info['initialization']['method'] if info['initialization'] else None,
+                initialization_batch_size=info['initialization']['batch_size'] if info['initialization'] else None,
+                refined_candidates=info['initialization']['refined_candidates'] if info['initialization'] else 0)
     if optimizations:
         ref = optimizations['cpu']
         for backend, result in optimizations.items():
