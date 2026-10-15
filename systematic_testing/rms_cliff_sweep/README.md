@@ -162,6 +162,12 @@ CSV tables under `results/bouchet/rms_cliff_sweep/analysis/diversity_comparison/
 Coverage counts identify incomplete groups. Optional `X_LIMITS` and `Y_LIMITS`
 apply equally to all three panels.
 
+An additional notebook plot uses the same means and AO-loop panels with darker
+±1 sample SD and lighter ±2 sample SD shaded bands, replacing error bars. These
+show between-case spread, not confidence intervals on the mean. Single-case
+groups have no estimated band. Run the shaded-plot cell after Refresh and plot,
+or Run All. Its PNG/PDF exports end in `_sigma_bands`.
+
 From the repository root on your Mac, **pull all three sweeps in one command**.
 The two remote roots contain the original array and the two stronger-diversity
 arrays; their job-ID subdirectories merge into one local results root. No new

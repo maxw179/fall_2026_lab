@@ -14,7 +14,7 @@ def plot_residual_vs_initial_rms(initial_rms, residual_rms, *, loop_indices=None
                                  ylabel='Residual wavefront RMS [waves]',
                                  reference_rms=.30, use_tex=True, plot_kind='mean',
                                  log_rms=False, expected_trials=None, show_uncorrected=True,
-                                 separate_loops=False):
+                                 separate_loops=False, sigma_bands=False):
     """Plot paired RMS sweeps using the shared 6-inch RMS figure conventions.
 
     residual_rms has axes (initial RMS, trial, AO loop). Each mean point averages
@@ -26,6 +26,7 @@ def plot_residual_vs_initial_rms(initial_rms, residual_rms, *, loop_indices=None
     separate_loops puts each mean curve on a separate panel with shared axes.
     For comparisons, residual_rms may map series labels to arrays of that same
     shape. Series use consistent colors across AO panels and separate error bars.
+    sigma_bands replaces error bars with darker +/-1 SD and lighter +/-2 SD bands.
     """
     initial = np.asarray(initial_rms, dtype=float)
     comparison = isinstance(residual_rms, dict)
@@ -42,6 +43,8 @@ def plot_residual_vs_initial_rms(initial_rms, residual_rms, *, loop_indices=None
         raise ValueError('Expected residual axes (initial RMS, trial, AO loop).')
     if plot_kind not in ('mean', 'box'):
         raise ValueError('plot_kind must be mean or box.')
+    if sigma_bands and plot_kind != 'mean':
+        raise ValueError('Sigma bands require mean plots.')
     if separate_loops and plot_kind != 'mean':
         raise ValueError('Separate-loop panels require mean/error-bar plots.')
     loops = list(range(values.shape[-1])) if loop_indices is None else list(loop_indices)
@@ -91,9 +94,16 @@ def plot_residual_vs_initial_rms(initial_rms, residual_rms, *, loop_indices=None
                                  for row in v])
                 std = np.array([row[np.isfinite(row)].std(ddof=1) if np.isfinite(row).sum() > 1 else np.nan
                                 for row in v])
-                ax.errorbar(initial, mean, yerr=std, fmt='o-', color=color,
-                            markersize=4, capsize=3, elinewidth=1,
-                            label=series_label if comparison else fr'Loop {loop+1} mean $\pm 1\sigma$')
+                label = series_label if comparison else fr'Loop {loop+1} mean $\pm 1\sigma$'
+                if sigma_bands:
+                    ax.fill_between(initial, mean-2*std, mean+2*std, color=color,
+                                    alpha=.10, linewidth=0)
+                    ax.fill_between(initial, mean-std, mean+std, color=color,
+                                    alpha=.25, linewidth=0)
+                    ax.plot(initial, mean, 'o-', color=color, markersize=4, label=label)
+                else:
+                    ax.errorbar(initial, mean, yerr=std, fmt='o-', color=color,
+                                markersize=4, capsize=3, elinewidth=1, label=label)
         diagonal = np.linspace(initial.min()*.01 if log_rms else 0., initial.max(), 512)
         if log_rms:
             all_values = np.concatenate([array[..., loops].ravel() for _, array in series])
@@ -121,6 +131,10 @@ def plot_residual_vs_initial_rms(initial_rms, residual_rms, *, loop_indices=None
             for ax in axes:
                 handles, labels = ax.get_legend_handles_labels()
                 legend.update(zip(labels, handles))
+            if sigma_bands:
+                from matplotlib.patches import Patch
+                legend[r'$\pm 1\sigma$ (darker)'] = Patch(facecolor='gray', alpha=.25)
+                legend[r'$\pm 2\sigma$ (lighter)'] = Patch(facecolor='gray', alpha=.10)
             fig.legend(legend.values(), legend.keys(), loc='upper center',
                        bbox_to_anchor=(.5, .99), ncol=len(legend), fontsize=8)
             fig.subplots_adjust(left=.055, right=.985, bottom=.13, top=.84, wspace=.08)

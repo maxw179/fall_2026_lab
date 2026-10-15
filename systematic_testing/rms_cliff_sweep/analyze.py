@@ -110,7 +110,7 @@ def discover_diversity_runs(directory):
     return found
 
 
-def plot_diversity_comparison(sweeps, *, metric='residual_rms', use_tex=True):
+def plot_diversity_comparison(sweeps, *, metric='residual_rms', use_tex=True, sigma_bands=False):
     """Overlay probe strengths in the established shared-axis AO-loop panels."""
     if metric not in ('residual_rms', 'estimation_rms'):
         raise ValueError('Choose residual_rms or estimation_rms.')
@@ -139,7 +139,7 @@ def plot_diversity_comparison(sweeps, *, metric='residual_rms', use_tex=True):
     return plot_residual_vs_initial_rms(first['initial_rms'][populated],
         {label: array[populated] for label, array in series.items()},
         loop_indices=[0, 1, 2], ylabel=ylabel, separate_loops=True,
-        reference_rms=None, show_uncorrected=True, use_tex=use_tex)
+        reference_rms=None, show_uncorrected=True, use_tex=use_tex, sigma_bands=sigma_bands)
 
 
 def analyze(directory, output=None, *, allow_partial=False, all_loops=False, use_tex=True,
