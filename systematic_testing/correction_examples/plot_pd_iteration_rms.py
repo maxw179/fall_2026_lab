@@ -10,6 +10,46 @@ from utils import zernike
 HISTORY_PATH = ROOT / "systematic_testing/rms_snr_sweep/results/pd_rms_snr_sweep_random100_iteration_histories.npz"
 
 
+def plot_residual_vs_initial_rms(initial_rms, residual_rms, *, loop_indices=None,
+                                 ylabel='Residual wavefront RMS [waves]',
+                                 reference_rms=.30, use_tex=True):
+    """Plot paired RMS sweeps using the shared 6-inch RMS figure conventions.
+
+    residual_rms has axes (initial RMS, trial, AO loop). Individual paired
+    directions remain visible; error bars show the mean and sample SD, including
+    every finite result regardless of the optimizer's convergence flag.
+    """
+    initial = np.asarray(initial_rms, dtype=float)
+    values = np.asarray(residual_rms, dtype=float)
+    if values.ndim != 3 or values.shape[0] != len(initial):
+        raise ValueError('Expected residual axes (initial RMS, trial, AO loop).')
+    loops = list(range(values.shape[-1])) if loop_indices is None else list(loop_indices)
+    if not loops or any(i < 0 or i >= values.shape[-1] for i in loops):
+        raise ValueError('Select saved zero-based AO loop indices.')
+    with plt.style.context('bmh'), plt.rc_context({'text.usetex': use_tex, 'font.size': 9, 'figure.dpi': 300}):
+        fig, ax = plt.subplots(figsize=(6, 6))
+        for loop in loops:
+            v = values[..., loop]
+            mean = np.array([row[np.isfinite(row)].mean() if np.isfinite(row).any() else np.nan
+                             for row in v])
+            std = np.array([row[np.isfinite(row)].std(ddof=1) if np.isfinite(row).sum() > 1 else np.nan
+                            for row in v])
+            color = f'C{loop % 10}'
+            ax.plot(initial, v, '.-', color=color, alpha=.15, linewidth=.6, markersize=2)
+            ax.errorbar(initial, mean, yerr=std, fmt='o-', color=color,
+                        markersize=4, capsize=2, label=fr'Loop {loop+1} mean $\pm$ SD')
+        ax.plot([0, initial.max()], [0, initial.max()], '--', color='black',
+                linewidth=1, label='Uncorrected RMS')
+        if reference_rms is not None:
+            ax.axvline(reference_rms, color='black', linestyle=':', linewidth=1,
+                       label=f'{reference_rms:g}-wave reference')
+        ax.set(xlabel='Initial wavefront RMS [waves]', ylabel=ylabel,
+               xlim=(0, initial.max()*1.04), ylim=(0, None))
+        ax.legend(loc='upper center', bbox_to_anchor=(.5, 1.16), ncol=2, fontsize=8)
+        fig.subplots_adjust(left=.15, right=.95, bottom=.13, top=.84)
+    return fig, ax
+
+
 def plot_iteration_rms(data, initial_rms, snr, trial, *, histories=None,
                        time_axis=False, use_tex=True):
     """Plot sweep histories with the established example style.
