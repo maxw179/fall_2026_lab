@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import asdict
 import json
 from pathlib import Path
 
@@ -92,6 +93,53 @@ def write_tables(data, output):
     save_npz(output/'sweep.npz', **{k: v for k, v in data.items() if k != 'config'},
              result_axes=['initial_rms', 'trial', 'ao_loop'],
              config_json=json.dumps(data['config'], sort_keys=True))
+
+
+def discover_diversity_runs(directory):
+    """Find downloaded job directories by probe magnitude, including legacy runs."""
+    found = {}
+    for run in sorted(Path(directory).glob('*')):
+        if not run.is_dir():
+            continue
+        metadata = next(run.glob('case_*/run.json'), None)
+        if metadata is None:
+            continue
+        config = json.loads(metadata.read_text())['config']
+        magnitude = SweepConfig(**config).diversity_rms
+        found.setdefault(magnitude, []).append(run)
+    return found
+
+
+def plot_diversity_comparison(sweeps, *, metric='residual_rms', use_tex=True):
+    """Overlay probe strengths in the established shared-axis AO-loop panels."""
+    if metric not in ('residual_rms', 'estimation_rms'):
+        raise ValueError('Choose residual_rms or estimation_rms.')
+    if not sweeps:
+        raise ValueError('No downloaded sweeps to compare.')
+    series, reference = {}, None
+    for magnitude, data in sorted(sweeps.items()):
+        config = asdict(SweepConfig(**data['config']))
+        actual = config.pop('diversity_rms')
+        # JSON metadata stores the RMS grid as a list, while defaults use tuples.
+        config['rms_values'] = tuple(config['rms_values'])
+        if not np.isclose(actual, magnitude):
+            raise ValueError(f'Diversity label {magnitude} disagrees with saved configuration {actual}.')
+        if reference is None:
+            reference = config
+        elif config != reference:
+            raise ValueError('Comparison sweeps differ in settings other than diversity RMS.')
+        series[fr'Diversity $\pm {magnitude:.2f}$ waves'] = data[metric]
+    first = next(iter(sweeps.values()))
+    populated = np.any([np.any(np.isfinite(array), axis=(1, 2))
+                        for array in series.values()], axis=0)
+    if not populated.any():
+        raise ValueError('No completed AO fits are available yet.')
+    ylabel = ('Applied residual RMS [waves]' if metric == 'residual_rms'
+              else 'Estimation RMS error before clipping [waves]')
+    return plot_residual_vs_initial_rms(first['initial_rms'][populated],
+        {label: array[populated] for label, array in series.items()},
+        loop_indices=[0, 1, 2], ylabel=ylabel, separate_loops=True,
+        reference_rms=None, show_uncorrected=True, use_tex=use_tex)
 
 
 def analyze(directory, output=None, *, allow_partial=False, all_loops=False, use_tex=True,

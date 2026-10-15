@@ -24,9 +24,20 @@ def plot_residual_vs_initial_rms(initial_rms, residual_rms, *, loop_indices=None
     plot_kind='box' shows quartiles, median, 1.5-IQR whiskers and all outliers,
     with finite sample counts. log_rms adds an explicitly logarithmic Y axis.
     separate_loops puts each mean curve on a separate panel with shared axes.
+    For comparisons, residual_rms may map series labels to arrays of that same
+    shape. Series use consistent colors across AO panels and separate error bars.
     """
     initial = np.asarray(initial_rms, dtype=float)
-    values = np.asarray(residual_rms, dtype=float)
+    comparison = isinstance(residual_rms, dict)
+    series = [(label, np.asarray(array, dtype=float)) for label, array in residual_rms.items()] \
+        if comparison else [(None, np.asarray(residual_rms, dtype=float))]
+    if not series:
+        raise ValueError('Supply at least one residual series.')
+    values = series[0][1]
+    if any(array.shape != values.shape for _, array in series):
+        raise ValueError('Comparison series must have the same RMS, trial and AO loop axes.')
+    if comparison and plot_kind != 'mean':
+        raise ValueError('Comparison series require mean/error-bar plots.')
     if values.ndim != 3 or values.shape[0] != len(initial):
         raise ValueError('Expected residual axes (initial RMS, trial, AO loop).')
     if plot_kind not in ('mean', 'box'):
@@ -51,40 +62,42 @@ def plot_residual_vs_initial_rms(initial_rms, residual_rms, *, loop_indices=None
             ax = axes[li] if separate_loops else axes[0]
             if separate_loops:
                 ax.set_title(f'After {loop+1} AO '+('loop' if loop == 0 else 'loops'), fontsize=10)
-            v = values[..., loop]
-            color = palette[loop % len(palette)]
-            if plot_kind == 'box':
-                available = np.flatnonzero(np.any(np.isfinite(v), axis=1))
-                if not len(available):
+            for si, (series_label, series_values) in enumerate(series):
+                v = series_values[..., loop]
+                color = palette[(si if comparison else loop) % len(palette)]
+                if plot_kind == 'box':
+                    available = np.flatnonzero(np.any(np.isfinite(v), axis=1))
+                    if not len(available):
+                        continue
+                    spacing = float(np.min(np.diff(initial))) if len(initial) > 1 else float(initial[0])
+                    width = .65*spacing/len(loops)
+                    offset = (li-(len(loops)-1)/2)*width
+                    groups = [row[np.isfinite(row)] for row in v[available]]
+                    artists = ax.boxplot(groups, positions=initial[available]+offset,
+                        widths=.8*width, manage_ticks=False, whis=1.5, patch_artist=True,
+                        showfliers=True, boxprops=dict(facecolor=color, edgecolor=color, alpha=.35),
+                        medianprops=dict(color='black', linewidth=1.2),
+                        whiskerprops=dict(color=color), capprops=dict(color=color),
+                        flierprops=dict(marker='o', markersize=3, markerfacecolor='none',
+                                        markeredgecolor=color, alpha=.9))
+                    artists['boxes'][0].set_label(f'Loop {loop+1} residual distribution')
+                    for x, group in zip(initial[available]+offset, groups):
+                        label = (f'n={len(group)}' if expected_trials is None else
+                                 f'{len(group)}/{expected_trials}')
+                        ax.text(x, 1.005, label, transform=ax.get_xaxis_transform(),
+                                ha='center', va='bottom', rotation=90, fontsize=7, color=color)
                     continue
-                spacing = float(np.min(np.diff(initial))) if len(initial) > 1 else float(initial[0])
-                width = .65*spacing/len(loops)
-                offset = (li-(len(loops)-1)/2)*width
-                groups = [row[np.isfinite(row)] for row in v[available]]
-                artists = ax.boxplot(groups, positions=initial[available]+offset,
-                    widths=.8*width, manage_ticks=False, whis=1.5, patch_artist=True,
-                    showfliers=True, boxprops=dict(facecolor=color, edgecolor=color, alpha=.35),
-                    medianprops=dict(color='black', linewidth=1.2),
-                    whiskerprops=dict(color=color), capprops=dict(color=color),
-                    flierprops=dict(marker='o', markersize=3, markerfacecolor='none',
-                                    markeredgecolor=color, alpha=.9))
-                artists['boxes'][0].set_label(f'Loop {loop+1} residual distribution')
-                for x, group in zip(initial[available]+offset, groups):
-                    label = (f'n={len(group)}' if expected_trials is None else
-                             f'{len(group)}/{expected_trials}')
-                    ax.text(x, 1.005, label, transform=ax.get_xaxis_transform(),
-                            ha='center', va='bottom', rotation=90, fontsize=7, color=color)
-                continue
-            mean = np.array([row[np.isfinite(row)].mean() if np.isfinite(row).any() else np.nan
-                             for row in v])
-            std = np.array([row[np.isfinite(row)].std(ddof=1) if np.isfinite(row).sum() > 1 else np.nan
-                            for row in v])
-            ax.errorbar(initial, mean, yerr=std, fmt='o-', color=color,
-                        markersize=4, capsize=3, elinewidth=1,
-                        label=fr'Loop {loop+1} mean $\pm 1\sigma$')
+                mean = np.array([row[np.isfinite(row)].mean() if np.isfinite(row).any() else np.nan
+                                 for row in v])
+                std = np.array([row[np.isfinite(row)].std(ddof=1) if np.isfinite(row).sum() > 1 else np.nan
+                                for row in v])
+                ax.errorbar(initial, mean, yerr=std, fmt='o-', color=color,
+                            markersize=4, capsize=3, elinewidth=1,
+                            label=series_label if comparison else fr'Loop {loop+1} mean $\pm 1\sigma$')
         diagonal = np.linspace(initial.min()*.01 if log_rms else 0., initial.max(), 512)
         if log_rms:
-            finite = values[..., loops][np.isfinite(values[..., loops])]
+            all_values = np.concatenate([array[..., loops].ravel() for _, array in series])
+            finite = all_values[np.isfinite(all_values)]
             if not len(finite) or np.any(finite <= 0):
                 plt.close(fig)
                 raise ValueError('A logarithmic RMS axis requires positive finite residuals.')

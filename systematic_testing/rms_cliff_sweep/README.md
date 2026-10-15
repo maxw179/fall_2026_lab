@@ -142,19 +142,44 @@ this; twelve-hour completion is a target, not a scheduler guarantee.
 
 Download each new array using the command below, replacing `rms_cliff_baseline`
 with `rms_cliff_stronger_diversities` and `ARRAY_JOB_ID` with its printed ID.
-Set the notebook's `RUN_DIR` to that local job-ID directory to plot it.
+The notebook discovers these downloaded runs automatically; use `RUN_DIRS` to select a specific job ID if needed.
 
 ## Download and analyze
 
 Open [rms_cliff_analysis.ipynb](rms_cliff_analysis.ipynb) in the
-`phase_diversity_env` kernel for local notebook analysis. Set `RUN_DIR`, then
-Run All after each download. The **Refresh and plot** cell can also be rerun
-by itself: it reloads raw case checkpoints, displays the three AO loop panels
-with shared linear axes, mean ±1 SD error bars and y=x references, and updates
-the PNG/PDF exports and numerical tables. Coverage counts identify incomplete
-groups. Optional `X_LIMITS` and `Y_LIMITS` apply equally to all three panels.
+`phase_diversity_env` kernel for local notebook analysis. It compares the
+±0.10, ±0.20 and ±0.30-wave sweeps using the existing three AO-loop panels,
+shared linear axes, mean ±1 sample SD error bars and y=x references. Each
+diversity strength has the same color across panels. The notebook detects the
+new job IDs from saved metadata; `RUN_DIRS` can select a specific run when there
+are multiple runs at one strength. Available runs plot while missing downloads
+are reported as pending. It rejects sweeps whose experimental settings differ
+in anything except diversity strength.
 
-From your Mac, retrieve the result root (including all case subdirectories):
+Run All after setup, or rerun **Refresh and plot** after each download. This
+reloads raw case checkpoints and updates figures, per-run tables and combined
+CSV tables under `results/bouchet/rms_cliff_sweep/analysis/diversity_comparison/`.
+Coverage counts identify incomplete groups. Optional `X_LIMITS` and `Y_LIMITS`
+apply equally to all three panels.
+
+From the repository root on your Mac, **pull all three sweeps in one command**.
+The two remote roots contain the original array and the two stronger-diversity
+arrays; their job-ID subdirectories merge into one local results root. No new
+job IDs need to be entered:
+
+```bash
+mkdir -p results/bouchet/rms_cliff_sweep
+rsync -avP \
+  mcw77@transfer-bouchet.ycrc.yale.edu:/nfs/roberts/project/pi_cr876/mcw77/rms_cliff_baseline/results/bouchet/rms_cliff_sweep/ \
+  mcw77@transfer-bouchet.ycrc.yale.edu:/nfs/roberts/project/pi_cr876/mcw77/rms_cliff_stronger_diversities/results/bouchet/rms_cliff_sweep/ \
+  results/bouchet/rms_cliff_sweep/
+```
+
+Rerunning the same command downloads new and updated checkpoints. It does not
+remove local files. This uses one rsync invocation and SSH connection; the
+three sweeps are retrieved together, without parallel SSH logins.
+
+To download and analyze a single array instead:
 
 ```bash
 mkdir -p results/bouchet/rms_cliff_sweep/ARRAY_JOB_ID

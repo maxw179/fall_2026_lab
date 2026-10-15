@@ -1,6 +1,6 @@
 """Scientific controls, real small-grid fitting, and incomplete-array analysis."""
 import contextlib
-from dataclasses import replace
+from dataclasses import asdict, replace
 import io
 import json
 import os
@@ -19,7 +19,8 @@ import numpy as np
 from optimization import reconstruction
 from systematic_testing.gpu_demo.run_demo import MODES, coefficients
 from systematic_testing.noise_robustness.noise_calibration import calibrated_noise
-from systematic_testing.rms_cliff_sweep.analyze import analyze, load_sweep
+from systematic_testing.rms_cliff_sweep.analyze import (
+    analyze, discover_diversity_runs, load_sweep, plot_diversity_comparison)
 from systematic_testing.rms_cliff_sweep.run_sweep import (
     SweepConfig, expected_snr, make_scene, run_case)
 from utils import zernike
@@ -221,6 +222,70 @@ class CUDADiversity020(CUDASmallSweep):
 
 class CUDADiversity030(CUDASmallSweep):
     diversity_rms = .30
+
+
+class ComparisonChecks(unittest.TestCase):
+    def make_sweeps(self):
+        sweeps = {}
+        for magnitude in (.1, .2, .3):
+            values = np.array([[[.01, .02, .03], [.03, .04, .05], [.05, .06, .07]],
+                               [[.10, .11, .12], [.12, .13, .14], [.14, .15, .16]]]) * (magnitude/.1)
+            if magnitude == .3:
+                values[0, 1:] = np.nan  # One case: no estimable SD.
+                values[1] = np.nan  # Missing RMS group must remain missing.
+            config = asdict(SweepConfig(rms_values=(.1, .3), trials=3, diversity_rms=magnitude))
+            if magnitude == .1:
+                config.pop('diversity_rms')  # Legacy baseline metadata.
+            sweeps[magnitude] = dict(config=config, initial_rms=np.array([.1, .3]),
+                                     residual_rms=values, estimation_rms=2*values)
+        return sweeps
+
+    def test_three_strengths_preserve_means_sample_sd_missing_cases_and_shared_axes(self):
+        import matplotlib.pyplot as plt
+        sweeps = self.make_sweeps()
+        fig, axes = plot_diversity_comparison(sweeps, use_tex=USE_TEX)
+        try:
+            self.assertEqual(len(axes), 3)
+            for loop, ax in enumerate(axes):
+                self.assertEqual(len(ax.containers), 3)
+                self.assertTrue(ax.get_shared_x_axes().joined(axes[0], ax))
+                self.assertTrue(ax.get_shared_y_axes().joined(axes[0], ax))
+                for index, magnitude in enumerate((.1, .2, .3)):
+                    line, _, bars = ax.containers[index].lines
+                    values = sweeps[magnitude]['residual_rms'][..., loop]
+                    finite = values[0][np.isfinite(values[0])]
+                    self.assertAlmostEqual(line.get_ydata()[0], finite.mean())
+                    self.assertEqual(line.get_color(), axes[0].containers[index].lines[0].get_color())
+                    segment = bars[0].get_segments()[0]
+                    if len(finite) > 1:
+                        np.testing.assert_allclose(segment[:, 1], finite.mean()+np.array([-1, 1])*finite.std(ddof=1))
+                    else:
+                        self.assertEqual(segment.size, 0)
+                        self.assertTrue(np.isnan(line.get_ydata()[1]))
+                diagonal = [line for line in ax.lines if line.get_label() == 'Uncorrected RMS']
+                self.assertEqual(len(diagonal), 1)
+                np.testing.assert_array_equal(diagonal[0].get_xdata(), diagonal[0].get_ydata())
+            self.assertEqual(len(fig.legends[0].texts), 4)
+            with tempfile.TemporaryDirectory() as temporary:
+                fig.savefig(Path(temporary)/'comparison.png', dpi=300)
+        finally:
+            plt.close(fig)
+        sweeps[.2]['config']['noise_seed'] = 99
+        with self.assertRaisesRegex(ValueError, 'settings other than diversity'):
+            plot_diversity_comparison(sweeps, use_tex=USE_TEX)
+
+    def test_discovery_keeps_duplicate_runs_and_recognizes_legacy_baseline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, magnitude in (('baseline', .1), ('strong020', .2), ('repeat020', .2), ('strong030', .3)):
+                case = root/name/'case_0000'
+                case.mkdir(parents=True)
+                config = self.make_sweeps()[magnitude]['config']
+                (case/'run.json').write_text(json.dumps({'config': config}))
+            (root/'analysis').mkdir()
+            found = discover_diversity_runs(root)
+            self.assertEqual({key: len(paths) for key, paths in found.items()}, {.1: 1, .2: 2, .3: 1})
+            self.assertEqual(discover_diversity_runs(root/'not_downloaded'), {})
 
 
 class SubmissionChecks(unittest.TestCase):
