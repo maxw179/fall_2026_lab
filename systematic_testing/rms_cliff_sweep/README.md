@@ -107,7 +107,7 @@ While the baseline is running, fetch the update and create a **new checkout**
 for these arrays. Run this yourself on Bouchet:
 
 ```bash
-cd /nfs/roberts/project/pi_cr876/mcw77/fall_2026_lab
+cd /nfs/roberts/project/pi_cr876/mcw77/rms_cliff_baseline
 git fetch origin
 git worktree add --detach ../rms_cliff_stronger_diversities origin/codex/rms-cliff-sweep
 cd ../rms_cliff_stronger_diversities
