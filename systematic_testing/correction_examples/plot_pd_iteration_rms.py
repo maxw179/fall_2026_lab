@@ -12,42 +12,109 @@ HISTORY_PATH = ROOT / "systematic_testing/rms_snr_sweep/results/pd_rms_snr_sweep
 
 def plot_residual_vs_initial_rms(initial_rms, residual_rms, *, loop_indices=None,
                                  ylabel='Residual wavefront RMS [waves]',
-                                 reference_rms=.30, use_tex=True):
+                                 reference_rms=.30, use_tex=True, plot_kind='mean',
+                                 log_rms=False, expected_trials=None, show_uncorrected=True,
+                                 separate_loops=False):
     """Plot paired RMS sweeps using the shared 6-inch RMS figure conventions.
 
-    residual_rms has axes (initial RMS, trial, AO loop). Individual paired
-    directions remain visible; error bars show the mean and sample SD, including
-    every finite result regardless of the optimizer's convergence flag.
+    residual_rms has axes (initial RMS, trial, AO loop). Each mean point averages
+    the available aberration cases; error bars show +/- one sample SD across those
+    cases, including every finite result regardless of optimizer convergence.
+    A single available case has a mean point but no estimable SD error bar.
+    plot_kind='box' shows quartiles, median, 1.5-IQR whiskers and all outliers,
+    with finite sample counts. log_rms adds an explicitly logarithmic Y axis.
+    separate_loops puts each mean curve on a separate panel with shared axes.
     """
     initial = np.asarray(initial_rms, dtype=float)
     values = np.asarray(residual_rms, dtype=float)
     if values.ndim != 3 or values.shape[0] != len(initial):
         raise ValueError('Expected residual axes (initial RMS, trial, AO loop).')
+    if plot_kind not in ('mean', 'box'):
+        raise ValueError('plot_kind must be mean or box.')
+    if separate_loops and plot_kind != 'mean':
+        raise ValueError('Separate-loop panels require mean/error-bar plots.')
     loops = list(range(values.shape[-1])) if loop_indices is None else list(loop_indices)
     if not loops or any(i < 0 or i >= values.shape[-1] for i in loops):
         raise ValueError('Select saved zero-based AO loop indices.')
+    # Resolve colors before the style context so patches and lines retain the
+    # same sweep colors when the figure is saved after leaving that context.
+    palette = plt.rcParams['axes.prop_cycle'].by_key()['color']
     with plt.style.context('bmh'), plt.rc_context({'text.usetex': use_tex, 'font.size': 9, 'figure.dpi': 300}):
-        fig, ax = plt.subplots(figsize=(6, 6))
-        for loop in loops:
+        if separate_loops:
+            fig, axes = plt.subplots(1, len(loops), figsize=(6*len(loops), 6),
+                                     sharex=True, sharey=True, squeeze=False)
+            axes = axes[0]
+        else:
+            fig, ax = plt.subplots(figsize=(6, 6))
+            axes = np.array([ax])
+        for li, loop in enumerate(loops):
+            ax = axes[li] if separate_loops else axes[0]
+            if separate_loops:
+                ax.set_title(f'After {loop+1} AO '+('loop' if loop == 0 else 'loops'), fontsize=10)
             v = values[..., loop]
+            color = palette[loop % len(palette)]
+            if plot_kind == 'box':
+                available = np.flatnonzero(np.any(np.isfinite(v), axis=1))
+                if not len(available):
+                    continue
+                spacing = float(np.min(np.diff(initial))) if len(initial) > 1 else float(initial[0])
+                width = .65*spacing/len(loops)
+                offset = (li-(len(loops)-1)/2)*width
+                groups = [row[np.isfinite(row)] for row in v[available]]
+                artists = ax.boxplot(groups, positions=initial[available]+offset,
+                    widths=.8*width, manage_ticks=False, whis=1.5, patch_artist=True,
+                    showfliers=True, boxprops=dict(facecolor=color, edgecolor=color, alpha=.35),
+                    medianprops=dict(color='black', linewidth=1.2),
+                    whiskerprops=dict(color=color), capprops=dict(color=color),
+                    flierprops=dict(marker='o', markersize=3, markerfacecolor='none',
+                                    markeredgecolor=color, alpha=.9))
+                artists['boxes'][0].set_label(f'Loop {loop+1} residual distribution')
+                for x, group in zip(initial[available]+offset, groups):
+                    label = (f'n={len(group)}' if expected_trials is None else
+                             f'{len(group)}/{expected_trials}')
+                    ax.text(x, 1.005, label, transform=ax.get_xaxis_transform(),
+                            ha='center', va='bottom', rotation=90, fontsize=7, color=color)
+                continue
             mean = np.array([row[np.isfinite(row)].mean() if np.isfinite(row).any() else np.nan
                              for row in v])
             std = np.array([row[np.isfinite(row)].std(ddof=1) if np.isfinite(row).sum() > 1 else np.nan
                             for row in v])
-            color = f'C{loop % 10}'
-            ax.plot(initial, v, '.-', color=color, alpha=.15, linewidth=.6, markersize=2)
             ax.errorbar(initial, mean, yerr=std, fmt='o-', color=color,
-                        markersize=4, capsize=2, label=fr'Loop {loop+1} mean $\pm$ SD')
-        ax.plot([0, initial.max()], [0, initial.max()], '--', color='black',
-                linewidth=1, label='Uncorrected RMS')
-        if reference_rms is not None:
-            ax.axvline(reference_rms, color='black', linestyle=':', linewidth=1,
-                       label=f'{reference_rms:g}-wave reference')
-        ax.set(xlabel='Initial wavefront RMS [waves]', ylabel=ylabel,
-               xlim=(0, initial.max()*1.04), ylim=(0, None))
-        ax.legend(loc='upper center', bbox_to_anchor=(.5, 1.16), ncol=2, fontsize=8)
-        fig.subplots_adjust(left=.15, right=.95, bottom=.13, top=.84)
-    return fig, ax
+                        markersize=4, capsize=3, elinewidth=1,
+                        label=fr'Loop {loop+1} mean $\pm 1\sigma$')
+        diagonal = np.linspace(initial.min()*.01 if log_rms else 0., initial.max(), 512)
+        if log_rms:
+            finite = values[..., loops][np.isfinite(values[..., loops])]
+            if not len(finite) or np.any(finite <= 0):
+                plt.close(fig)
+                raise ValueError('A logarithmic RMS axis requires positive finite residuals.')
+        for ai, ax in enumerate(axes):
+            if show_uncorrected:
+                ax.plot(diagonal, diagonal, '--', color='black',
+                        linewidth=1, label='Uncorrected RMS')
+            if reference_rms is not None:
+                ax.axvline(reference_rms, color='black', linestyle=':', linewidth=1,
+                           label=f'{reference_rms:g}-wave reference')
+            if log_rms:
+                ax.set_yscale('log')
+                ax.set_ylim(bottom=min(float(finite.min()), float(initial.min()))*.7)
+            else:
+                ax.set_ylim(bottom=0)
+            ax.set(xlabel='Initial wavefront RMS [waves]',
+                   ylabel=(ylabel+' (log scale)' if log_rms else ylabel) if ai == 0 else '',
+                   xlim=(0, initial.max()*1.04))
+        if separate_loops:
+            legend = {}
+            for ax in axes:
+                handles, labels = ax.get_legend_handles_labels()
+                legend.update(zip(labels, handles))
+            fig.legend(legend.values(), legend.keys(), loc='upper center',
+                       bbox_to_anchor=(.5, .99), ncol=len(legend), fontsize=8)
+            fig.subplots_adjust(left=.055, right=.985, bottom=.13, top=.84, wspace=.08)
+        else:
+            axes[0].legend(loc='upper center', bbox_to_anchor=(.5, 1.16), ncol=2, fontsize=8)
+            fig.subplots_adjust(left=.15, right=.95, bottom=.13, top=.84)
+    return fig, axes if separate_loops else axes[0]
 
 
 def plot_iteration_rms(data, initial_rms, snr, trial, *, histories=None,

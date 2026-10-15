@@ -94,7 +94,10 @@ def write_tables(data, output):
              config_json=json.dumps(data['config'], sort_keys=True))
 
 
-def analyze(directory, output=None, *, allow_partial=False, all_loops=False, use_tex=True):
+def analyze(directory, output=None, *, allow_partial=False, all_loops=False, use_tex=True,
+            boxplots=False, log_rms=False, separate_loops=False):
+    if separate_loops and boxplots:
+        raise ValueError('Separate-loop panels require mean/error-bar plots.')
     data = load_sweep(directory)
     complete = data['completed'].sum()
     expected = data['completed'].size
@@ -105,16 +108,42 @@ def analyze(directory, output=None, *, allow_partial=False, all_loops=False, use
         raise ValueError('No completed fits to plot; prepared inputs contain no RMS results.')
     output = Path(output) if output is not None else Path(directory)/'analysis'
     write_tables(data, output)
-    loops = [0, 1, 2] if all_loops else [2]
+    loops = [0, 1, 2] if all_loops or separate_loops else [2]
     for metric, ylabel, stem in (
             ('residual_rms', 'Applied residual RMS [waves]', 'residual_vs_initial_rms'),
             ('estimation_rms', 'Estimation RMS error before clipping [waves]', 'estimation_vs_initial_rms')):
-        fig, _ = plot_residual_vs_initial_rms(data['initial_rms'], data[metric],
-                                             loop_indices=loops, ylabel=ylabel, use_tex=use_tex)
-        for ext in ('png', 'pdf'):
-            fig.savefig(output/f'{stem}.{ext}', dpi=300)
         import matplotlib.pyplot as plt
-        plt.close(fig)
+        from matplotlib.backends.backend_pdf import PdfPages
+        suffix = ('_panels' if separate_loops else '')+('_log' if log_rms else '')
+        if boxplots:
+            available = data[metric][..., loops]
+            finite = available[np.isfinite(available)]
+            if not len(finite):
+                continue
+            upper = max(float(finite.max()), float(data['initial_rms'].max()))*1.18
+            lower = min(float(finite.min()), float(data['initial_rms'].min()))*.7 if log_rms else 0.
+            with PdfPages(output/f'{stem}_boxplots{suffix}.pdf') as pages:
+                for loop in loops:
+                    if not np.any(np.isfinite(data[metric][..., loop])):
+                        continue
+                    fig, ax = plot_residual_vs_initial_rms(data['initial_rms'], data[metric],
+                        loop_indices=[loop], ylabel=ylabel, use_tex=use_tex,
+                        plot_kind='box', log_rms=log_rms, expected_trials=data['config']['trials'])
+                    ax.set_ylim(lower, upper)
+                    for ext in ('png', 'pdf'):
+                        fig.savefig(output/f'{stem}_boxplot_loop_{loop+1}{suffix}.{ext}', dpi=300)
+                    pages.savefig(fig, dpi=300)
+                    plt.close(fig)
+        else:
+            populated = np.any(np.isfinite(data[metric][..., loops]), axis=(1, 2))
+            if not populated.any():
+                continue
+            fig, _ = plot_residual_vs_initial_rms(data['initial_rms'][populated], data[metric][populated],
+                loop_indices=loops, ylabel=ylabel, use_tex=use_tex, log_rms=log_rms,
+                reference_rms=None, show_uncorrected=True, separate_loops=separate_loops)
+            for ext in ('png', 'pdf'):
+                fig.savefig(output/f'{stem}{suffix}.{ext}', dpi=300)
+            plt.close(fig)
     missing = np.flatnonzero(~np.all(data['completed'], axis=-1).ravel())
     print(f'Completed loops: {complete}/{expected}; completed cases: '
           f'{np.sum(data["status"] == "complete")}/{data["status"].size}')
@@ -130,10 +159,14 @@ def main():
     parser.add_argument('--output', type=Path)
     parser.add_argument('--allow-partial', action='store_true')
     parser.add_argument('--all-loops', action='store_true', help='Show all three loops; default is loop 3.')
+    parser.add_argument('--separate-loops', action='store_true', help='Show all three AO loops side by side with shared axis scaling.')
+    parser.add_argument('--boxplots', action='store_true', help='One box-and-whisker figure per loop, plus a combined PDF.')
+    parser.add_argument('--log-rms', action='store_true', help='Also support an explicitly logarithmic residual axis.')
     parser.add_argument('--no-tex', action='store_true', help='Explicit rendering fallback without LaTeX.')
     args = parser.parse_args()
     analyze(args.directory, args.output, allow_partial=args.allow_partial,
-            all_loops=args.all_loops, use_tex=not args.no_tex)
+            all_loops=args.all_loops, use_tex=not args.no_tex,
+            boxplots=args.boxplots, log_rms=args.log_rms, separate_loops=args.separate_loops)
 
 
 if __name__ == '__main__':

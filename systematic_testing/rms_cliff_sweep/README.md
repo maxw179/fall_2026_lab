@@ -27,7 +27,8 @@ case. One Slurm array task uses one GPU; the default concurrency limit is four.
   Poisson/Gaussian streams. Negative observations are retained.
 - Four acquisition focal planes over −2 to +2 µm; 41 truth-object planes and
   21 fitted object planes over the same interval; three-photon vector optics.
-- Three normalized probe modes at −0.10, 0, +0.10 waves per loop:
+- Three normalized probe modes at −0.10, 0, +0.10 waves per loop by default
+  (`--diversity-rms` selects the nonzero magnitude):
   `[-2,2], [0,4], [2,2]`, then `[-3,3], [0,4], [3,3]`, then
   `[-4,4], [0,4], [4,4]`. Each loop acquires 36 fresh frames; cumulative fits use
   **36 / 72 / 108 frames**, preserving past noise and SLM phase offsets.
@@ -92,7 +93,66 @@ the convergence flag is a separate diagnostic from correction accuracy.
 Existing case directories are never overwritten. Failed or timed-out cases
 retain completed loops, while unfinished entries remain missing.
 
+## Additional full sweeps at ±0.20 and ±0.30 waves
+
+The submission helper queues **two independent 400-case arrays**, one with
+−0.20, 0, +0.20-wave probes and one with −0.30, 0, +0.30-wave probes. Both use
+the full twenty-level RMS grid, twenty original aberration directions, and the
+same case indices and RNG seeds as the baseline. SNR calibration, detector
+settings, acquisition planes, three AO loops, optimizer settings and ±0.10-wave
+modal correction clipping are preserved. Each array saves to its own job-ID
+result directory.
+
+While the baseline is running, fetch the update and create a **new checkout**
+for these arrays. Run this yourself on Bouchet:
+
+```bash
+cd /nfs/roberts/project/pi_cr876/mcw77/fall_2026_lab
+git fetch origin
+git worktree add --detach ../rms_cliff_stronger_diversities origin/codex/rms-cliff-sweep
+cd ../rms_cliff_stronger_diversities
+bash systematic_testing/rms_cliff_sweep/submit_stronger_diversities.sh
+```
+
+The helper prints the two new array IDs. It permits **12 simultaneous tasks
+per new array**, with one GPU per task, and allows the partitions
+`gpu_h100,gpu_h200,gpu_b200,gpu_rtx6000`. The last partition adds RTX Pro 6000
+Blackwell GPUs with 96 GB device memory. These are upper bounds, not reserved
+GPUs: all arrays, including the baseline, compete for available resources and
+account/group limits. Yale currently documents per-user running-job limits of
+12 H100, 6 H200, 6 B200 and 16 RTX Pro 6000 jobs; see the
+[Bouchet hardware and partition limits](https://docs.ycrc.yale.edu/clusters/bouchet/).
+Device model and CUDA environment are saved for each task. Task zero runs the
+small CPU/CUDA workflow checks at all three diversity magnitudes.
+
+To inspect the commands without submitting, add `--dry-run`. To change the cap
+or restrict the GPU types, use, for example:
+
+```bash
+bash systematic_testing/rms_cliff_sweep/submit_stronger_diversities.sh \
+  --concurrency 12 --partitions gpu_h100,gpu_h200,gpu_b200 --dry-run
+```
+
+At the observed baseline rate of roughly 6 minutes per case, the **800 new
+cases require about 80 GPU-hours**, plus the remaining baseline work. With
+roughly 1,100 cases remaining across all three sweeps, 12 continuously occupied
+GPUs would take about 9.2 hours, or 16 GPUs about 6.9 hours. Queue waits, harder
+fits and the unmeasured speed of the new diversity/RTX combinations can extend
+this; twelve-hour completion is a target, not a scheduler guarantee.
+
+Download each new array using the command below, replacing `rms_cliff_baseline`
+with `rms_cliff_stronger_diversities` and `ARRAY_JOB_ID` with its printed ID.
+Set the notebook's `RUN_DIR` to that local job-ID directory to plot it.
+
 ## Download and analyze
+
+Open [rms_cliff_analysis.ipynb](rms_cliff_analysis.ipynb) in the
+`phase_diversity_env` kernel for local notebook analysis. Set `RUN_DIR`, then
+Run All after each download. The **Refresh and plot** cell can also be rerun
+by itself: it reloads raw case checkpoints, displays the three AO loop panels
+with shared linear axes, mean ±1 SD error bars and y=x references, and updates
+the PNG/PDF exports and numerical tables. Coverage counts identify incomplete
+groups. Optional `X_LIMITS` and `Y_LIMITS` apply equally to all three panels.
 
 From your Mac, retrieve the result root (including all case subdirectories):
 
@@ -109,8 +169,9 @@ python -m systematic_testing.rms_cliff_sweep.analyze \
 The analysis writes these to the result root's `analysis/` directory:
 
 - `residual_vs_initial_rms.{png,pdf}`: applied RMS after loop 3 versus initial
-  RMS, all 20 paired traces and mean ± sample SD, the uncorrected diagonal and
-  a 0.30-wave reference line.
+  RMS. Each point averages the available aberration cases; error bars show
+  mean ± one sample SD across cases. The view covers RMS levels with saved
+  results. Single-case groups have a mean point but no SD error bar.
 - `estimation_vs_initial_rms.{png,pdf}`: loop-3 estimation error **before modal
   clipping**, to distinguish inference error from limited applied updates.
 - `trials.csv`: every scheduled condition and loop, including missing entries,
@@ -127,6 +188,18 @@ loops 1–3 together. Plotting extends the shared RMS helper with its `bmh` styl
 6 × 6-inch layout, external legend, LaTeX text and 300 DPI exports. `--no-tex`
 is an explicit fallback. Analysis performs no optimization or image simulation.
 
+Use `--separate-loops` for three side-by-side mean/error-bar panels with shared
+X and Y scaling, one for each AO loop, retaining the y=x reference in each panel.
+These exports use the suffix `_panels.{png,pdf}`.
+
+For box-and-whisker plots, add `--boxplots --all-loops`. This exports one figure
+per AO loop and a three-page PDF, using common Y limits across the loops. Boxes
+span the 25th–75th percentiles, black lines mark medians, whiskers reach the
+most extreme observations within 1.5 IQR, and circles retain all outliers.
+Labels show completed/expected trial counts; RMS levels without data are omitted.
+Add `--log-rms` for separately named logarithmic-axis exports that resolve the
+small residuals and large errors together. Linear and logarithmic files coexist.
+
 ## Local validation and input preview
 
 ```bash
@@ -141,7 +214,9 @@ trial 0, without CUDA startup or fitting. A matching preview is already saved
 locally at `results/rms_cliff_sweep_setup/preview/case_0200/`.
 Small-grid CPU tests exercise real three-loop fits, noise calibration and replay,
 paired directions, historical measurements/SLM offsets, clipping and RMS
-diagnostics, partial-data accounting and offline plot export. Set `REQUIRE_CUDA=1`
+diagnostics, partial-data accounting and offline plot export at all three probe
+magnitudes. Submission checks verify two full 400-case arrays, GPU partitions,
+concurrency overrides and dry-run behavior. Set `REQUIRE_CUDA=1`
 on a GPU node to additionally exercise the same checks with CUDA reconstruction.
 
 Custom `--rms-values` or `--trials` change the required array bounds; use

@@ -35,6 +35,7 @@ class SweepConfig:
     reconstruction_planes: int = 21
     snr: float = 10.
     gaussian_to_poisson_rms: float = 1.
+    diversity_rms: float = .10
     aberration_seed: int = 0
     noise_seed: int = 1
     rho: float = 1e46
@@ -55,8 +56,8 @@ class SweepConfig:
         if min(self.aberration_seed, self.noise_seed, self.random_starts) < 0:
             raise ValueError('Seeds and random-start count must be nonnegative.')
         if any(not np.isfinite(v) or v <= 0 for v in (
-                self.snr, self.rho, self.gaussian_to_poisson_rms)):
-            raise ValueError('SNR, rho and Gaussian/Poisson RMS ratio must be finite and positive.')
+                self.snr, self.rho, self.gaussian_to_poisson_rms, self.diversity_rms)):
+            raise ValueError('SNR, rho, diversity RMS and Gaussian/Poisson RMS ratio must be finite and positive.')
         if self.backend not in ('cpu', 'cuda'):
             raise ValueError('Select cpu or cuda explicitly.')
 
@@ -77,7 +78,7 @@ def make_scene(config, rms_index, trial):
         for mode in loop_modes:
             unit = zernike.RMSAberration([mode], [1.], 1., microscope.alpha)
             probes.extend(zernike.Aberration([mode], unit.strengths*bias)
-                          for bias in (-.10, 0., .10))
+                          for bias in (-config.diversity_rms, 0., config.diversity_rms))
         schedule.append(probes)
     return microscope, grid, sample, reconstruction_z, direction, truth, schedule
 
@@ -173,7 +174,7 @@ def run_case(config, output, case_index, *, prepare_only=False):
             microscope=dict(MICROSCOPE, grid_bfp=config.pupil_size),
             bead_center_mm=[0., 0., 0.], bead_radius_mm=.001,
             focal_z_mm=FOCAL_Z, diversity_modes_by_loop=DIVERSITY_MODES_BY_LOOP,
-            diversity_rms_waves=[-.10, 0., .10], num_ao_loops=3,
+            diversity_rms_waves=[-config.diversity_rms, 0., config.diversity_rms], num_ao_loops=3,
             gain=1., max_modal_update=.10, reuse_acquisitions=True,
             random_start_seed=0, random_start_rms_range=[.005, .50])
         save_npz(output/'scene.npz', modes=MODES, wavefront_direction=direction,
@@ -246,7 +247,8 @@ def run_case(config, output, case_index, *, prepare_only=False):
                   f'estimation error {estimation[n-1]:.6f} waves; {timings[-1]["message"]}', flush=True)
 
         history = correction.stack_feedback(simulator, grid, sample_z, FOCAL_Z,
-            [-2, 2], [-.10, 0., .10], config.rho, 108, gain=1., max_update=.10,
+            [-2, 2], [-config.diversity_rms, 0., config.diversity_rms],
+            config.rho, 108, gain=1., max_update=.10,
             diversity_schedule=schedule, diversity_strategy='joint', reuse_acquisitions=True,
             optimizer=optimizer, optimizer_kwargs=dict(method='newton',
                 max_iterations=config.max_iterations, num_random_starts=config.random_starts,
@@ -277,6 +279,8 @@ def main():
                  'random_starts', 'max_iterations', 'aberration_seed', 'noise_seed'):
         parser.add_argument('--'+name.replace('_', '-'), type=int, default=getattr(defaults, name))
     parser.add_argument('--rms-values', nargs='+', type=float, default=DEFAULT_RMS)
+    parser.add_argument('--diversity-rms', type=float, default=defaults.diversity_rms,
+                        help='Magnitude of signed diversity probes in waves; the zero probes are retained.')
     parser.add_argument('--backend', choices=('cuda', 'cpu'), default='cuda')
     args = vars(parser.parse_args())
     output, index = args.pop('output'), args.pop('case_index')
@@ -289,6 +293,7 @@ def main():
             print(f'{config.trials} paired aberrations x {len(config.rms_values)} RMS values = {count} cases')
             print(f'Slurm array: --array=0-{count-1}%4')
             print('RMS [waves]:', ' '.join(f'{x:g}' for x in config.rms_values))
+            print(f'Diversity RMS [waves]: {-config.diversity_rms:g} 0 {config.diversity_rms:g}')
             return
         if output is None:
             parser.error('--output is required unless --describe is used')

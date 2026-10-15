@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -26,6 +28,50 @@ USE_TEX = shutil.which('latex') is not None
 
 
 class ScientificControls(unittest.TestCase):
+    def test_probe_magnitude_changes_only_the_diversity_phases(self):
+        config = SweepConfig(size=8, pupil_size=12, sample_planes=9, reconstruction_planes=3)
+        baseline = make_scene(config, 10, 7)
+        for magnitude in (.20, .30):
+            with self.subTest(diversity_rms=magnitude):
+                changed = make_scene(replace(config, diversity_rms=magnitude), 10, 7)
+                np.testing.assert_array_equal(changed[2].image_mask, baseline[2].image_mask)
+                for index in (3, 4):
+                    np.testing.assert_array_equal(changed[index], baseline[index])
+                np.testing.assert_array_equal(changed[5].strengths, baseline[5].strengths)
+                for original_loop, changed_loop in zip(baseline[6], changed[6]):
+                    self.assertEqual(len(changed_loop), 9)
+                    for probe, original, target in zip(changed_loop, original_loop,
+                            np.tile([magnitude, 0., magnitude], 3)):
+                        np.testing.assert_allclose(coefficients(probe),
+                            coefficients(original)*magnitude/config.diversity_rms, atol=1e-15)
+                        self.assertAlmostEqual(zernike.zernike_RMS(probe, changed[0].alpha), target, places=12)
+        for invalid in (0., -.1, np.inf, np.nan):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                replace(config, diversity_rms=invalid).validate()
+
+    def test_prepared_variants_preserve_truth_and_noise_calibration(self):
+        config = SweepConfig(size=8, pupil_size=12, sample_planes=9, reconstruction_planes=3)
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()):
+            outputs = []
+            for magnitude in (.10, .20, .30):
+                out = Path(temporary)/str(magnitude)
+                meta = run_case(replace(config, diversity_rms=magnitude), out, 200, prepare_only=True)
+                self.assertEqual(meta['diversity_rms_waves'], [-magnitude, 0., magnitude])
+                self.assertEqual(meta['case_index'], 200)
+                self.assertEqual(meta['initial_rms'], .30)
+                with np.load(out/'case_0200/scene.npz') as scene, \
+                     np.load(out/'case_0200/acquisition_1.npz') as acquisition:
+                    outputs.append((meta, {key: scene[key].copy() for key in scene.files}))
+                    self.assertEqual(acquisition['images'].shape, (36, 8, 8))
+            for meta, scene in outputs[1:]:
+                baseline, original = outputs[0]
+                for key in original:
+                    np.testing.assert_array_equal(scene[key], original[key])
+                for key in ('exposure', 'gaussian_sigma', 'gaussian_read_sigma_e', 'expected_calibration_snr'):
+                    self.assertEqual(meta[key], baseline[key])
+                self.assertEqual({k: v for k, v in meta['config'].items() if k != 'diversity_rms'},
+                                 {k: v for k, v in baseline['config'].items() if k != 'diversity_rms'})
+
     def test_total_snr_and_equal_error_power(self):
         clean = np.linspace(.001, 2., 128).reshape(2, 8, 8)
         noise = calibrated_noise(clean, 'gaussian', 1., 10., 7, 8, gaussian_mean_sigma=0.)
@@ -52,6 +98,7 @@ class ScientificControls(unittest.TestCase):
 
 class SmallSweepChecks:
     backend = 'cpu'
+    diversity_rms = .10
 
     @classmethod
     def setUpClass(cls):
@@ -59,7 +106,7 @@ class SmallSweepChecks:
         cls.output = Path(cls.temp.name)/'sweep'
         cls.config = SweepConfig(rms_values=(.1, .3), trials=2, size=8, pupil_size=12,
             sample_planes=9, reconstruction_planes=3, random_starts=2,
-            max_iterations=1, backend=cls.backend)
+            max_iterations=1, backend=cls.backend, diversity_rms=cls.diversity_rms)
         cls.fit_inputs = []
         original = reconstruction.ReconstructionWorkspace
 
@@ -155,9 +202,70 @@ class CPUSmallSweep(SmallSweepChecks, unittest.TestCase):
     pass
 
 
+class CPUDiversity020(SmallSweepChecks, unittest.TestCase):
+    diversity_rms = .20
+
+
+class CPUDiversity030(SmallSweepChecks, unittest.TestCase):
+    diversity_rms = .30
+
+
 @unittest.skipUnless(os.environ.get('REQUIRE_CUDA') == '1', 'Set REQUIRE_CUDA=1 on a GPU node.')
 class CUDASmallSweep(SmallSweepChecks, unittest.TestCase):
     backend = 'cuda'
+
+
+class CUDADiversity020(CUDASmallSweep):
+    diversity_rms = .20
+
+
+class CUDADiversity030(CUDASmallSweep):
+    diversity_rms = .30
+
+
+class SubmissionChecks(unittest.TestCase):
+    def test_both_arrays_have_400_cases_and_requested_gpu_partitions(self):
+        source = Path(__file__).resolve().parents[1]/'systematic_testing/rms_cliff_sweep/submit_stronger_diversities.sh'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)/'source'
+            script = root/'systematic_testing/rms_cliff_sweep'/source.name
+            script.parent.mkdir(parents=True)
+            shutil.copy2(source, script)
+            bin_dir = Path(temporary)/'bin'
+            bin_dir.mkdir()
+            calls = Path(temporary)/'sbatch_calls.jsonl'
+            fake = bin_dir/'sbatch'
+            fake.write_text('#!'+sys.executable+'\n'
+                'import json,os,sys\nfrom pathlib import Path\n'
+                'p=Path(os.environ["TEST_SBATCH_CALLS"])\n'
+                'with p.open("a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n'
+                'print(600000+len(p.read_text().splitlines()))\n')
+            fake.chmod(0o755)
+            env = dict(os.environ, PATH=str(bin_dir)+os.pathsep+os.environ.get('PATH', ''),
+                       TEST_SBATCH_CALLS=str(calls))
+            dry = subprocess.run(['bash', str(script), '--dry-run'], env=env,
+                                 capture_output=True, text=True, check=True)
+            self.assertEqual(len(dry.stdout.splitlines()), 2)
+            self.assertFalse(calls.exists())
+            self.assertFalse((root/'logs').exists())
+            subprocess.run(['bash', str(script)], env=env, capture_output=True, text=True, check=True)
+            arguments = [json.loads(line) for line in calls.read_text().splitlines()]
+            self.assertEqual(len(arguments), 2)
+            for args, magnitude in zip(arguments, ('0.20', '0.30')):
+                self.assertIn('--array=0-399%12', args)
+                self.assertIn('--partition=gpu_h100,gpu_h200,gpu_b200,gpu_rtx6000', args)
+                self.assertEqual(args[-2:], ['--diversity-rms', magnitude])
+                self.assertNotIn('--min-rms', args)
+                self.assertFalse(any(a.startswith('--dependency') for a in args))
+            subprocess.run(['bash', str(script), '--concurrency', '6', '--partitions', 'gpu_h100,gpu_h200'],
+                           env=env, capture_output=True, text=True, check=True)
+            overridden = [json.loads(line) for line in calls.read_text().splitlines()][2:]
+            self.assertTrue(all('--array=0-399%6' in args for args in overridden))
+            self.assertTrue(all('--partition=gpu_h100,gpu_h200' in args for args in overridden))
+            invalid = subprocess.run(['bash', str(script), '--concurrency', '0'],
+                                     env=env, capture_output=True, text=True)
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertEqual(len(calls.read_text().splitlines()), 4)
 
 
 if __name__ == '__main__':
