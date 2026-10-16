@@ -29,22 +29,28 @@ class CUDAReconstruction(CPUReconstructionWorkspace):
     full acquisition. ``svd_method='qr'`` opts into batched QR reduction for
     eligible rectangular operators; direct SVD remains the default and the
     weak-regularization fallback. Screening defaults to bounded loss-only
-    linear solves; ``screening_method='serial'`` restores the original scoring
-    path. ``_xp`` is for portable numerical tests only.
+    linear solves with batched augmented QR for difficult frequencies, avoiding
+    direct SVD in bulk scoring. ``screening_fallback='svd'`` reproduces the old
+    fallback; ``screening_method='serial'`` restores original full-fit scoring.
+    ``_xp`` is for portable numerical tests only.
     """
     def __init__(self, *args, _xp=None, svd_method='direct',
-                 screening_method='linear', screening_batch_size=4, **kwargs):
+                 screening_method='linear', screening_batch_size=4,
+                 screening_fallback='qr', **kwargs):
         if svd_method not in ('direct', 'qr'):
             raise ValueError("svd_method must be 'direct' or 'qr'.")
         self.svd_method = svd_method
         self.svd_counts = dict(qr=0, direct=0)
         if screening_method not in ('linear', 'svd', 'serial'):
             raise ValueError("screening_method must be 'linear', 'svd', or 'serial'.")
+        if screening_fallback not in ('qr', 'svd'):
+            raise ValueError("screening_fallback must be 'qr' or 'svd'.")
         if (isinstance(screening_batch_size, (bool, np.bool_))
                 or not isinstance(screening_batch_size, (int, np.integer))
                 or screening_batch_size < 1):
             raise ValueError('screening_batch_size must be a positive integer.')
         self.screening_method = screening_method
+        self.screening_fallback = screening_fallback
         self.screening_batch_size = int(screening_batch_size)
         super().__init__(*args, _xp=_cupy() if _xp is None else _xp, **kwargs)
         self.backend = 'cuda'
@@ -127,7 +133,8 @@ class CUDAReconstruction(CPUReconstructionWorkspace):
         return otfs
 
     def _screen_frequency_losses(self, matrices, data, counts):
-        from optimization._screening import linear_screening_loss, spectral_screening_loss
+        from optimization._screening import (linear_screening_loss,
+            spectral_screening_loss, augmented_qr_screening_loss)
         xp = self.xp
         if self.screening_method == 'svd':
             counts['svd_fallback_frequencies'] += len(matrices)
@@ -139,7 +146,13 @@ class CUDAReconstruction(CPUReconstructionWorkspace):
             if min(matrices.shape[-2:]) > get_batched_gesv_limit():
                 safe[:] = False
         counts['linear_frequencies'] += int(np.count_nonzero(safe))
-        counts['svd_fallback_frequencies'] += int(np.count_nonzero(~safe))
+        counts['qr_frequencies' if self.screening_fallback == 'qr' else
+               'svd_fallback_frequencies'] += int(np.count_nonzero(~safe))
+
+        def fallback_loss(s, d):
+            if self.screening_fallback == 'qr':
+                return augmented_qr_screening_loss(s, d, self.rho, xp)
+            return spectral_screening_loss(s, d, self.rho, self._svd, xp)
 
         def linear(s, d):
             if xp is np:
@@ -151,12 +164,11 @@ class CUDAReconstruction(CPUReconstructionWorkspace):
         if np.all(safe):
             return linear(matrices, data)
         if not np.any(safe):
-            return spectral_screening_loss(matrices, data, self.rho, self._svd, xp)
+            return fallback_loss(matrices, data)
         values = xp.empty(len(matrices))
         good, fallback = xp.asarray(np.flatnonzero(safe)), xp.asarray(np.flatnonzero(~safe))
         values[good] = linear(matrices[good], data[good])
-        values[fallback] = spectral_screening_loss(
-            matrices[fallback], data[fallback], self.rho, self._svd, xp)
+        values[fallback] = fallback_loss(matrices[fallback], data[fallback])
         return values
 
     def _screen_candidates(self, candidates, on_completed=None):
@@ -165,7 +177,7 @@ class CUDAReconstruction(CPUReconstructionWorkspace):
         xp = self.xp
         count = len(candidates)
         batch_size = self._screen_batch_size(count)
-        counts = dict(linear_frequencies=0, svd_fallback_frequencies=0)
+        counts = dict(linear_frequencies=0, qr_frequencies=0, svd_fallback_frequencies=0)
         scores = np.empty(count)
         for start in range(0, count, max(batch_size, 1)):
             stop = min(start + batch_size, count)
@@ -198,6 +210,7 @@ class CUDAReconstruction(CPUReconstructionWorkspace):
             for index in finalists:
                 scores[index] = self.loss(candidates[index])
         self._last_screening_info = dict(method=self.screening_method, batch_size=batch_size,
+                                        fallback=self.screening_fallback,
                                         refined_candidates=len(finalists), **counts)
         if count and on_completed is not None:
             on_completed(count)

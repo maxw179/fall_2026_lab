@@ -3,8 +3,10 @@
 This runs the bead sweep's three-loop cumulative feedback experiment at 128 ×
 128 image pixels, recording core computation time and a portable reconstruction
 history. The input is a simulated three-photon vector image stack of five random
-beads with an initial pupil RMS of 0.20 waves. Plotting and animations run later
-on your Mac using saved arrays, without optimization or CPU object refits.
+beads with an initial pupil RMS of 0.20 waves. Local playback uses yesterday's
+AO image/wavefront viewer, without optimization, inverse object fits or voxels.
+It simulates four diagnostic images from saved applied SLM states and adds
+Poisson noise at the archived fixed exposure.
 
 ## Experiment
 
@@ -28,7 +30,8 @@ Defaults match `bead_count_sweep/pd_rms_bead_count_sweep.ipynb` except for the
 - `rho=1e46`; exact Newton Hessians; up to 50 accepted steps per loop.
 - 100 random candidates plus zero per fit, with the sweep's RMS range
   [0.005, 0.50] and seed 0. Use `--random-starts 1000` to try more candidates.
-- CUDA QR SVD and guarded loss-only linear screening; requested candidate batch
+- CUDA QR SVD and guarded loss-only linear screening, with batched augmented QR
+  for frequencies outside the linear guard; requested candidate batch
   size 8. The existing memory guard can reduce the effective batch size.
 
 The shared `correction.stack_feedback` controller implements the feedback and
@@ -72,7 +75,8 @@ cat results/bouchet/gpu_demo/JOB_ID/run.json
 Simulation runs on the CPU and is reported separately from GPU reconstruction.
 This job uses 17 fitted modes and cumulative acquisitions, so its runtime is
 measured independently of the earlier two-mode synthetic benchmarks. Logs show
-when acquisition, each cumulative fit, and subsequent object replay begin.
+when acquisition and each cumulative fit begin. Dense object-history export is
+optional; the image/wavefront replay does not use it.
 
 ## What is timed and saved
 
@@ -97,20 +101,20 @@ plotting. Lightweight timestamp callbacks remain in the measured optimizer.
 - `history.npz`: every recorded optimizer state, coefficient vector, loss,
   estimation RMS error and cumulative core timestamp; applied SLM coefficients,
   applied residual RMS and loop boundary times are also saved.
-- `object_history.npy`: float32 copies of estimated 3D objects, reconstructed on
+- `object_history.npy` (only with `--save-objects`): float32 copies of estimated 3D objects, reconstructed on
   the selected backend **after all three loops**, with no Hessians. Optimization
   remains double precision. Local plotting memory maps this file.
-- `object_frames.npz`: the history indices corresponding to the saved objects.
+- `object_frames.npz` (only with `--save-objects`): the history indices corresponding to the saved objects.
 - `correction_preview.npz`: the four-state image panels used by the sweep example
   helper. Before correction / after loops 1 and 2 use actual zero-diversity
   measurements. The after-loop-3 column is a separate simulated diagnostic,
   labeled `(sim.)`, generated after optimization and excluded from core timing.
 - `environment.txt` and `git-status.txt`: batch-job environment and source state.
 
-Every iteration is saved by default. `--object-stride 3` reduces post-run object
-replay and file size while always retaining each loop's last state. It does not
-change optimization or RMS history. Partial runs retain completed-loop numerical
-checkpoints; object playback becomes available after replay completes. A completed
+Every optimizer iteration is saved by default. `--save-objects` opts into dense
+object-history export; `--object-stride 3` then reduces that optional export while
+retaining each loop's final state. Neither changes optimization or RMS history.
+Partial runs retain completed-loop numerical checkpoints. A completed
 job can have iteration-limited optimizers: check `all_optimizers_converged` and
 each loop's message separately from the applied residual RMS.
 
@@ -130,10 +134,9 @@ python -m systematic_testing.gpu_demo.plot_demo results/bouchet/gpu_demo/JOB_ID
 ```
 
 This writes `figures/rms_time.{png,pdf}`, `rms_iterations.{png,pdf}`,
-`acquired_images.{png,pdf}`, `final_aberration.{png,pdf}`, `final_object.{png,pdf}`,
-and two GIFs: `aberration.gif` and `object.gif`. It directly reuses the sweep
-example plotting helpers and the original testing notebooks' polar-phase and
-3D-object animation helper: `bmh`, LaTeX text, 300 DPI static exports, 6 × 6-inch
+`acquired_images.{png,pdf}`, `final_aberration.{png,pdf}`, and the standalone
+`figures/ao_replay.html`. Static plots directly reuse the sweep example helpers:
+`bmh`, LaTeX text, 300 DPI static exports, 6 × 6-inch
 RMS/correction figures, polar phase insets, shared normalization and the existing
 loop annotations and external legend. The time-axis plot changes only the
 horizontal coordinate. The saved estimates retain their unconstrained,
@@ -143,26 +146,41 @@ The RMS curves show the same two diagnostics as the sweep examples: **estimation
 error inside each fit**, and **residual RMS after the clipped AO correction**.
 The time axis excludes acquisition, replay and export; it measures cumulative
 core computation time rather than total job wall time. Animation titles include
-these timestamps, but the GIF uses fixed-duration frames rather than real-time
-playback. Phase animations subtract the current SLM phase from the fitted
-residual estimate, showing the inferred original static aberration across loops.
+these timestamps, but playback uses fixed-duration frames rather than real time.
+The existing AO viewer shows true residual, estimated current residual and
+accumulated SLM phase in three polar panels, initial/current noisy simulated
+images, and the saved RMS progress trace. The estimated wavefront updates at
+every saved optimizer step. Images and physical residual change only at applied
+corrections, because the SLM is fixed during each fit. After application, the
+last estimate is expressed in the new SLM frame, as in yesterday's demonstration.
+Image and phase scales remain fixed throughout. Diagnostic images do not count
+as acquisitions and do not consume the original noise RNG. Their fresh Poisson
+draws use a separate reproducible seed, one realization per applied SLM state,
+and the original exposure calibrated to the initial reference SNR.
 
-Animations use the original notebook's 92nd-percentile object threshold.
-To reduce local rendering time while retaining each loop's final state:
+Open the HTML file directly in your browser for play/pause, previous/next,
+scrubbing and playback-speed controls:
+
+```bash
+open results/bouchet/gpu_demo/JOB_ID/figures/ao_replay.html
+```
+
+To show fewer intermediate optimizer states while retaining each loop's last state:
 
 ```bash
 python -m systematic_testing.gpu_demo.plot_demo results/bouchet/gpu_demo/JOB_ID \
   --stride 3
 ```
 
-This uses `utils.plotting.animate_reconstruction` with precomputed samples;
-it performs no inverse fits on the Mac. `--no-animations` exports only static
+This uses `systematic_testing.ao_animation.viewer` from the existing AO demo.
+It performs no inverse fits on the Mac. `--no-animations` exports only static
 plots. LaTeX is enabled by default, matching the examples; `--no-tex` is an
 explicit fallback for machines without LaTeX.
 
 Open `demo_analysis.ipynb` for interactive local inspection and notebook playback.
 The notebook selects the most recently downloaded demo by default; its path is
-printed so you can choose another run explicitly.
+printed so you can choose another run explicitly. Interrupt any older voxel
+cell, rerun the setup cell to reload the helpers, then run the new replay cell.
 
 ## Local smoke check
 
@@ -180,3 +198,35 @@ The destination must be new, so previous runs are never overwritten. CUDA tests:
 ```bash
 REQUIRE_CUDA=1 python -m unittest discover -s tests -p test_gpu_demo.py -v
 ```
+
+## Shared-baseline 64 × 64 camera-noise run
+
+The runner also accepts `--shared-zero --diversity-settings -.10 -.05 .05 .10`.
+This acquires one zero-diversity frame plus four settings for each of three
+modes at each of four z positions: 52 fresh frames per loop, and 52 / 104 / 156
+frames in the cumulative fits. `--size 64` changes only the image grid.
+
+Camera parameters `--read-sigma-e`, `--background-e` and `--checkerboard-e`
+combine Gaussian read noise, Poisson background and fixed alternating checker
+pixel offsets with signal Poisson noise. They use the noise-testing
+`simulate_camera` model. Only the known electronic pedestal/gain is removed;
+background and checkerboard remain in the observations. Negative values are
+retained. `--snr` calibrates signal-only shot-noise exposure from the initial
+aberrated z=0 image; it is not the total SNR after adding the other components.
+Exposure and camera parameters remain fixed through the AO loops.
+
+Add `--prepare-only` to generate the exact first 52 noisy frames locally without
+CUDA or optimization. This writes `scene.npz`, `loop_1_input.npz` and `run.json`
+with status `prepared`. Repeat the same command without `--prepare-only`, using
+a new output directory, for the full feedback run. The first loop is identical
+for the same configuration and NumPy version. Later acquisitions depend on the
+preceding fitted corrections and therefore cannot be prepared before fitting.
+
+In `demo_analysis.ipynb`, set `RUN_DIR` to the prepared directory for a preview
+of all 52 actual frames in the existing image/wavefront viewer. Set it to the
+completed cluster directory for RMS plots and AO replay. Shared-baseline runs
+show archived noisy zero-diversity frames in replay, at the acquired plane
+nearest `FOCUS_MM`; no denoising or inverse refitting is performed. After the
+third correction there is no fourth acquisition loop: its displayed image is
+an independently noised diagnostic with the same detector parameters and is
+labeled as simulated. Probe frames remain in each `loop_*_input.npz`.

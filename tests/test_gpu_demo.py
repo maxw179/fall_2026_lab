@@ -9,13 +9,13 @@ from unittest.mock import patch
 
 import matplotlib
 matplotlib.use('Agg')
-from matplotlib.animation import PillowWriter
 import numpy as np
 
 from optimization import reconstruction
 from systematic_testing.gpu_demo.run_demo import (
     DemoConfig, MODES, coefficients, make_scene, run_demo)
-from systematic_testing.gpu_demo.plot_demo import load_run, make_animations, make_plots, plot_rms
+from systematic_testing.gpu_demo.plot_demo import load_run, make_replay, make_plots, plot_rms
+from systematic_testing.gpu_demo.replay import load_gpu_case
 from utils import zernike
 
 try:
@@ -37,7 +37,7 @@ class DemoChecks:
         cls.output = Path(cls.temp.name)/'demo'
         cls.config = DemoConfig(backend=cls.backend, size=8, pupil_size=12,
             sample_planes=9, reconstruction_planes=3, random_starts=2, max_iterations=1,
-            object_stride=2)
+            object_stride=2, save_objects=True)
         with contextlib.redirect_stdout(io.StringIO()):
             run_demo(cls.config, cls.output)
         cls.metadata, cls.scene, cls.history = load_run(cls.output)
@@ -105,17 +105,40 @@ class DemoChecks:
                 final = np.flatnonzero(self.history['loop'] == loop)[-1]
                 self.assertIn(final, frames['history_indices'])
 
-    def test_offline_plots_and_notebook_animations_never_refit(self):
+    def test_offline_plots_and_image_wavefront_replay_never_refit(self):
         from utils import psf
         with patch.object(reconstruction, 'estimate_sample_3D', side_effect=AssertionError('Unexpected local refit')), \
              patch.object(psf.Microscope, 'compute_image_3D', side_effect=AssertionError('Unexpected local simulation')):
             output = make_plots(self.output, use_tex=False)
             self.assertTrue((output/'rms_time.png').exists())
             self.assertTrue((output/'acquired_images.png').exists())
-            animations = make_animations(self.output, stride=20, dpi=35, use_tex=False)
-            for i, animation in enumerate(animations):
-                animation.save(output/f'notebook_{i}.gif', writer=PillowWriter(fps=2))
-                self.assertGreater((output/f'notebook_{i}.gif').stat().st_size, 100)
+        with patch.object(reconstruction, 'estimate_sample_3D', side_effect=AssertionError('Unexpected local refit')), \
+             patch.object(psf.Microscope, 'compute_image_3D') as forward:
+            forward.side_effect = lambda *args, **kwargs: (self.scene['x'], self.scene['y'],
+                np.asarray(kwargs['focal_z_levels']), np.ones((1, 8, 8)))
+            viewer = make_replay(self.output, stride=20, use_tex=False, show_progress=False)
+            self.assertEqual(forward.call_count, 4)
+            self.assertIn('<iframe', viewer.data)
+            document = (output/'ao_replay.html').read_text()
+            self.assertIn('const frames=', document)
+            self.assertIn('id="seek"', document)
+            self.assertNotIn('voxels', document)
+
+    def test_gpu_history_replay_preserves_all_steps_slm_frames_and_times(self):
+        frames, points, _ = load_gpu_case(self.output)
+        self.assertEqual(len(frames), len(self.history['iteration'])+4)
+        self.assertEqual([p['images_taken'] for p in points], [0, 36, 72, 108])
+        fit_frames = [f for f in frames if 'optimization_rms' in f]
+        np.testing.assert_allclose([f['optimization_rms'] for f in fit_frames], self.history['rms_error'])
+        np.testing.assert_array_equal([f['core_elapsed_seconds'] for f in fit_frames],
+                                      self.history['core_elapsed_seconds'])
+        for loop in range(1, 4):
+            selected = [f for f in fit_frames if f['loop'] == loop]
+            for frame in selected:
+                np.testing.assert_array_equal(frame['image'], selected[0]['image'])
+        final = frames[-1]
+        self.assertAlmostEqual(final['rms'], self.metadata['final_residual_rms'], places=12)
+        self.assertEqual(final['core_elapsed_seconds'], self.history['loop_end_core_seconds'][-1])
 
     def test_rms_figure_keeps_shared_sweep_style(self):
         import matplotlib.pyplot as plt

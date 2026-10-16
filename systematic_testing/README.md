@@ -5,6 +5,7 @@ Each experiment folder contains its notebooks and helpers, with numerical output
 | Folder | Experiment |
 |---|---|
 | [rms_snr_sweep](rms_snr_sweep/) | Phase-diversity RMS/SNR sweeps, archives, iteration histories and analysis |
+| [rms_cliff_sweep](rms_cliff_sweep/) | Paired 20-direction, 64 × 64 single-bead RMS baseline at combined Poisson/Gaussian SNR 10; parallel Bouchet array and offline analysis |
 | [correction_examples](correction_examples/) | Correction image grids and iteration-error plots |
 | [noise_robustness](noise_robustness/) | Camera models, noise experiments and acquisition comparisons |
 | [random_start_benchmark](random_start_benchmark/) | Random-start replay and closed-loop benchmarks |

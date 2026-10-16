@@ -40,3 +40,25 @@ utils.zip
 
 *.json
 *.pdf
+
+# Generated replays, microscope calibration figures, snapshots and job logs.
+*.html
+*.fig
+*.zip
+*.tar
+*.tgz
+*.gz
+*.7z
+*.err
+*.patch
+*.avi
+*.mkv
+/results/
+**/solve/
+**/solve_*/
+**/submission/
+**/submission_*/
+experimental_10_15/3d_*/
+experimental_10_15/**/REPORT.md
+systematic_testing/noise_robustness_results
+systematic_testing/random_start_benchmark_results

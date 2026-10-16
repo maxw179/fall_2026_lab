@@ -9,7 +9,6 @@ import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-from matplotlib.animation import PillowWriter
 import numpy as np
 
 from systematic_testing.correction_examples.plot_pd_correction_examples import plot_correction_example
@@ -62,7 +61,7 @@ def _sample(grid, levels, values):
                               for z, plane in zip(levels, values)])
 
 
-def make_plots(folder, output=None, *, use_tex=True, percentile=92):
+def make_plots(folder, output=None, *, use_tex=True):
     """Export RMS and four-state correction figures using the sweep helpers."""
     folder = Path(folder)
     metadata, scene, history = load_run(folder)
@@ -89,10 +88,8 @@ def make_plots(folder, output=None, *, use_tex=True, percentile=92):
             metadata['config']['snr'], 0, acquired_planes=True, precomputed_images=images,
             microscope=microscope, grid=grid, example_title=title, use_tex=use_tex)
         save(fig, 'acquired_images')
-    if (folder/'object_history.npy').exists():
+    if len(history['static_estimate_strengths']):
         from utils.zernike import Aberration
-        objects = np.load(folder/'object_history.npy', mmap_mode='r', allow_pickle=False)
-        final = _sample(grid, scene['reconstruction_z'], objects[-1])
         with plt.style.context('bmh'), plt.rc_context({
                 'text.usetex': use_tex, 'font.size': 12, 'figure.dpi': 300,
                 'figure.figsize': [548/72, 390/72]}):
@@ -100,43 +97,32 @@ def make_plots(folder, output=None, *, use_tex=True, percentile=92):
             fig, _ = plotting.zernike_plot(phase.construct_map(microscope.alpha),
                                           microscope.alpha, res=150, show=False)
             save(fig, 'final_aberration')
-            fig, _ = plotting.plot_sample_3D(final,
-                threshold=float(np.percentile(final.image_mask, percentile)), show=False)
-            save(fig, 'final_object')
     return output
 
 
-def make_animations(folder, *, stride=1, fps=4, percentile=92, dpi=100, use_tex=True):
-    """Use the original notebook's polar-phase and 3D-object animation helper.
+def make_replay(folder, *, stride=1, focus=0., use_tex=True, show_progress=True,
+                output_path=None):
+    """Render the existing AO image/wavefront viewer from saved GPU coefficients.
 
-    Objects come from saved GPU arrays; no object fit or optimization is run.
-    Phase frames show the inferred static aberration across all three loops.
-    Fixed-duration playback includes the measured core timestamp in each title.
+    No voxel rendering, object refit, or optimization is performed. Simulated
+    diagnostic images are computed once per applied state (four for three loops),
+    with Poisson noise at the archived fixed exposure.
     """
-    if stride < 1 or fps <= 0 or not 0 <= percentile <= 100:
-        raise ValueError('stride/fps must be positive and percentile must be in [0, 100].')
+    from systematic_testing.gpu_demo.replay import load_gpu_case
+    from systematic_testing.ao_animation.viewer import show_replay
+    from tqdm.auto import tqdm
+
     folder = Path(folder)
-    metadata, scene, history = load_run(folder)
-    with np.load(folder/'object_frames.npz', allow_pickle=False) as saved:
-        available = saved['history_indices']
-    indices = []
-    for loop in np.unique(history['loop']):
-        ids = np.flatnonzero(history['loop'][available] == loop)
-        indices.extend(sorted(set(ids[::stride]) | {ids[-1]}))
-    selected = available[indices]
-    objects = np.load(folder/'object_history.npy', mmap_mode='r', allow_pickle=False)
-    microscope, grid = _geometry(metadata)
-    samples = [_sample(grid, scene['reconstruction_z'], objects[index]) for index in indices]
-    entries = [dict(iteration=int(history['iteration'][i]), loss=float(history['loss'][i]),
-                    strengths=history['static_estimate_strengths'][i],
-                    title=f'AO loop {history["loop"][i]}, iteration {history["iteration"][i]}\n'
-                          f'Core time {history["core_elapsed_seconds"][i]:.2f} s; '
-                          f'RMS error {history["rms_error"][i]:.4f} waves') for i in selected]
-    with plt.style.context('bmh'), plt.rc_context({
-            'text.usetex': use_tex, 'font.size': 12, 'figure.dpi': 300,
-            'figure.figsize': [548/72, 390/72]}):
-        return plotting.animate_reconstruction(dict(history=entries), scene['modes'], microscope,
-            precomputed_samples=samples, interval=1000/fps, percentile=percentile, dpi=dpi)
+    if show_progress:
+        print('Preparing simulated images for the saved AO states...', flush=True)
+    frames, points, title = load_gpu_case(folder, stride=stride, focus=focus)
+    output_path = Path(output_path) if output_path else folder/'figures'/'ao_replay.html'
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tqdm(total=len(frames), desc='Rendering image/wavefront replay', unit='frame',
+              disable=not show_progress) as progress, plt.style.context('bmh'), plt.rc_context({
+            'text.usetex': use_tex, 'font.size': 12}):
+        return show_replay(frames, points, title=title, output_path=output_path,
+            on_frame=lambda event: progress.update(event['completed']-progress.n))
 
 
 def main():
@@ -145,20 +131,87 @@ def main():
     parser.add_argument('--no-animations', action='store_true')
     parser.add_argument('--no-tex', action='store_true', help='Explicit fallback for machines without LaTeX.')
     parser.add_argument('--stride', type=int, default=1)
-    parser.add_argument('--fps', type=float, default=4)
-    parser.add_argument('--percentile', type=float, default=92)
+    parser.add_argument('--focus', type=float, default=0., help='Diagnostic focus in mm; default z=0.')
     args = parser.parse_args()
-    if args.stride < 1 or args.fps <= 0 or not 0 <= args.percentile <= 100:
-        parser.error('stride/fps must be positive and percentile must be in [0, 100]')
+    if args.stride < 1 or not np.isfinite(args.focus):
+        parser.error('stride must be positive and focus must be finite')
     plt.switch_backend('Agg')
-    output = make_plots(args.folder, use_tex=not args.no_tex, percentile=args.percentile)
+    output = make_plots(args.folder, use_tex=not args.no_tex)
     if not args.no_animations:
-        animations = make_animations(args.folder, stride=args.stride, fps=args.fps,
-                                     percentile=args.percentile, use_tex=not args.no_tex)
-        for name, animation in zip(('aberration', 'object'), animations):
-            animation.save(output/f'{name}.gif', writer=PillowWriter(fps=args.fps))
+        make_replay(args.folder, stride=args.stride, focus=args.focus, use_tex=not args.no_tex)
+        print(f'Open {output / "ao_replay.html"} in your browser for playback.')
     print(f'Plots saved in {output}')
 
 
 if __name__ == '__main__':
     main()
+
+
+def plot_acquisition_geometry(folder, *, use_tex=True):
+    """Saved truth sample and every fresh acquisition diversity, grouped by loop."""
+    from utils import zernike
+    folder = Path(folder)
+    metadata, scene, _ = load_run(folder)
+    microscope, grid = _geometry(metadata)
+    sample = _sample(grid, scene['sample_z'], scene['sample'])
+    positions = np.asarray(metadata['focal_positions_mm'])
+    schedules = []
+    previous_count = 0
+    for summary in metadata['loops']:
+        with np.load(folder/f'loop_{summary["loop"]}_input.npz', allow_pickle=False) as data:
+            fresh_count = summary['fit_images']-previous_count
+            fresh = data['diversity_strengths'][-fresh_count:]
+            focal = data['focal_z'][-fresh_count:]
+            probes = fresh[np.isclose(focal, positions[0], rtol=0, atol=1e-12)]
+            # Historical frames include SLM offsets; fresh phases are the probes.
+            for position in positions:
+                np.testing.assert_allclose(fresh[np.isclose(focal, position, rtol=0, atol=1e-12)], probes)
+            schedules.append(probes)
+        previous_count = summary['fit_images']
+    columns = max(map(len, schedules))
+    with plt.style.context('bmh'), plt.rc_context({'text.usetex': use_tex, 'font.size': 10,
+                                                  'figure.dpi': 300}):
+        fig = plt.figure(figsize=(20, 8))
+        outer = fig.add_gridspec(1, 2, width_ratios=(1.15, 2.5),
+                                left=.025, right=.985, bottom=.09, top=.86, wspace=.08)
+        ax = fig.add_subplot(outer[0], projection='3d')
+        plotting.plot_sample_3D(sample, threshold=0., alpha=.32, ax=ax, show=False)
+        x, y = sample.get_xy()
+        xx, yy = np.meshgrid([x.min(), x.max()], [y.min(), y.max()])
+        for level in positions:
+            ax.plot_surface(xx, yy, np.full_like(xx, level), color='red',
+                            alpha=.13, shade=False, edgecolor='red', linewidth=.7)
+        from matplotlib.ticker import FuncFormatter
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.set_major_formatter(FuncFormatter(lambda v, _: f'{v*1000:g}'))
+        ax.set_xlabel(r'$x$ ($\mu$m)')
+        ax.set_ylabel(r'$y$ ($\mu$m)')
+        ax.set_zlabel(r'$z$ ($\mu$m)')
+        ax.view_init(elev=23, azim=-55)
+        panels = outer[1].subgridspec(len(schedules), columns, wspace=.28, hspace=.5)
+        phase_axes = []
+        for row, probes in enumerate(schedules):
+            for col, strengths in enumerate(probes):
+                polar = fig.add_subplot(panels[row, col], projection='polar')
+                aberration = zernike.Aberration(scene['modes'], strengths)
+                plotting.zernike_plot(aberration.construct_map(microscope.alpha),
+                                      microscope.alpha, res=101, ax=polar, show=False, colorbar=False)
+                active = np.flatnonzero(abs(strengths)>1e-12)
+                if len(active) == 1:
+                    m, n = scene['modes'][active[0]]
+                    rms = np.sign(strengths[active[0]])*zernike.zernike_RMS(aberration, microscope.alpha)
+                    label = rf'$Z_{{{n}}}^{{{m}}}$: ${rms:+.2f}$ waves'
+                elif len(active) == 0:
+                    label = 'Zero diversity'
+                else:
+                    label = f'{zernike.zernike_RMS(aberration, microscope.alpha):.2f} waves RMS'
+                polar.set_title(label, fontsize=8, pad=7)
+                if col == 0:
+                    polar.text(-.28, .5, f'Loop {row+1}', rotation=90,
+                               va='center', ha='center', transform=polar.transAxes, fontsize=11)
+                phase_axes.append(polar)
+        cax = fig.add_axes([.52, .045, .30, .018])
+        fig.colorbar(phase_axes[0].collections[0], cax=cax, orientation='horizontal',
+                     ticks=[-np.pi, 0, np.pi], label='Applied diversity phase (rad)')
+        cax.set_xticklabels([r'$-\pi$', '$0$', r'$\pi$'])
+    return fig

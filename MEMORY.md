@@ -1,5 +1,7 @@
 # Project handoff — 2026-09-29
 
+**Historical snapshot:** for the current experimental workflow, findings, run status and Bouchet command-only preference, read [experimental_10_15/HANDOFF.md](experimental_10_15/HANDOFF.md). Runtime and implementation notes below describe the older state.
+
 ## Implemented
 
 - `utils/psf.py`: scalar/vector 3D image formation; per-image known aberration diversities added to a shared unknown aberration. Repeat focal positions for multiple diversities.

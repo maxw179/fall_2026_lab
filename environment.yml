@@ -12,6 +12,7 @@ dependencies:
   - ipykernel>=6,<8
   - ipywidgets>=8,<9
   - jupyterlab>=4,<5
+  - h5py  # Existing MATLAB v7.3 acquisition imports
   - pillow
   - tqdm
   - pip

@@ -94,6 +94,8 @@ def animate_reconstruction(info: dict, modes, microscope, *,
         try:
             fig.set_dpi(dpi)
             fig.suptitle(title, fontsize=9)
+            for axis in fig.axes:
+                if axis.name == 'polar':axis.set_position([.1,.23,.8,.62])
             canvas = FigureCanvasAgg(fig)
             canvas.draw()
             return np.asarray(canvas.buffer_rgba())[..., :3].copy()
@@ -251,7 +253,7 @@ def plot_sample_3D(sample: Image_Mask_3D, threshold: float = 0.0,
         ax.voxels(xe[:, None, None], ye[None, :, None], ze[None, None, :],
                   visible, facecolors=colors.to_rgba(values.ravel(), alpha=alpha).reshape(values.shape + (4,)),
                   edgecolors=(0.3, 0.3, 0.3, alpha), linewidth=0.2, shade=False)
-        fig.colorbar(colors, ax=ax, label="Sample value", shrink=0.7)
+        fig.colorbar(colors, ax=ax, label="Sample value", shrink=0.7, pad=0.20)
     ax.set_xlabel("x [mm]")
     ax.set_ylabel("y [mm]")
     ax.set_zlabel("z [mm]")
@@ -717,7 +719,7 @@ def many_composite(
     vmax: float | bool=2 * np.pi,
     is_edge: bool=False,
     is_horizontal: bool=True,
-    *, ax=None,
+    *, ax=None, inset_loc="upper right",
 ):
     axs = np.ravel(axs if ax is None else ax)
     fig = axs[0].figure
@@ -757,7 +759,7 @@ def many_composite(
             ax,
             width="35%",
             height="35%",
-            loc="upper right",
+            loc=inset_loc,
             borderpad=0,
         )
         fig.canvas.draw()

@@ -257,8 +257,16 @@ the iterative SVD work for eligible small matrices.
 
 Forming a Gram matrix can amplify rounding errors when regularization is weak.
 The linear route is used only when sum(abs(S)**2)/rho <= 1e6 and the smaller
-system is within CuPy's batched solve size limit. Other frequencies use a stable
-SVD loss in singular coordinates, including left-null-space residuals. Candidates
+system is within CuPy's batched solve size limit. Other frequencies now use
+batched Householder QR of an augmented least-squares operator, without a Gram
+matrix or direct SVD. For K>P, factor [S; sqrt(rho) I] and apply the reflectors
+to [D; 0]; the trailing transformed entries give the minimized loss. For K<=P,
+factor [S^H; sqrt(rho) I], then forward-substitute R^H z=sqrt(rho) D and score
+||z||^2. Both evaluate the unchanged regularized objective in math/math.tex.
+Scaling all rows of the augmented operator together changes neither its column
+space nor the physical rho. The score uses at most min(K,P) reflector columns.
+Use screening_fallback="svd" to reproduce the previous guarded SVD fallback.
+Candidates
 within 4e-8 relative of the best fast score are rechecked with the canonical loss
 before choosing the starting point. No point is dropped and no physical
 parameter, Fourier frequency or precision is changed.
@@ -284,14 +292,27 @@ peak-memory guarantee. OOM/device errors propagate. The workspace is still
 single-device and cannot be called concurrently from multiple threads.
 
 info['initialization'] additionally reports method, effective batch_size,
-refined_candidates and linear_frequencies/svd_fallback_frequencies. Progress
+fallback, refined_candidates, linear_frequencies, qr_frequencies and
+svd_fallback_frequencies. The default bulk scoring has zero direct-SVD fallbacks;
+canonical near-winner checks and Newton fitting retain their existing SVD path.
+Progress
 counts completed candidates in chunks. screen_losses clears fit caches and
 restores reuse_svd even when scoring or progress callbacks fail.
 
 Portable checks compare linear/SVD scores against full fits, ill-conditioned
 operators at the guard boundary, small rho and left null spaces, zero-data and
 near-tied candidates, seeded selection/optimizer results, callback progress and
-failure cleanup. Actual new-path CUDA speedup has not been measured yet.
+failure cleanup. Augmented QR tests also cover the AO matrix dimensions
+36/72/108 by 21, rank deficiency, left null spaces, wide/square operators,
+extreme optical scales, weak regularization and brightness homogeneity. Its
+CUDA performance on the saved AO workload still needs measurement.
+
+For fixed S and rho, replacing D by cD multiplies the fitted object by c and
+the minimized loss by |c|^2. Uniform brightness scaling therefore preserves
+candidate ranking, aberration minimizers and comparisons of rho using loss
+ratios. This does not rescale the optical operator S, change the noise
+realization or change SNR. The computational guard depends on S and rho,
+not on the observed pixel brightness. No change to rho is needed to use QR.
 
 The isolated benchmark compares identical 101-point pools using original serial
 GPU fitting and loss-only batches 1, 4, and 8. It checks every score and selected

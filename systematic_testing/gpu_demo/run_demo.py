@@ -47,6 +47,11 @@ class DemoConfig:
     initial_rms: float = .20
     beads: int = 5
     snr: float = 15.
+    diversity_settings: tuple = (-.10, 0., .10)
+    shared_zero: bool = False
+    read_sigma_e: float = 0.
+    checkerboard_e: float = 0.
+    background_e: float = 0.
     rho: float = 1e46
     trial: int = 0
     sample_planes: int = 41
@@ -58,6 +63,7 @@ class DemoConfig:
     derivative_batch_size: int = 8
     frequency_batch_size: int = 4096
     object_stride: int = 1
+    save_objects: bool = False
     backend: str = 'cuda'
 
 
@@ -109,11 +115,11 @@ def make_scene(config):
     truth = zernike.RMSAberration(MODES, direction, config.initial_rms, microscope.alpha)
     schedule = []
     for loop_modes in DIVERSITY_MODES_BY_LOOP:
-        probes = []
+        probes = [zernike.Aberration(MODES, np.zeros(len(MODES)))] if config.shared_zero else []
         for mode in loop_modes:
             unit = zernike.RMSAberration([mode], [1.], 1., microscope.alpha)
             probes.extend(zernike.Aberration([mode], unit.strengths*bias)
-                          for bias in DIVERSITY_RMS)
+                          for bias in config.diversity_settings)
         schedule.append(probes)
     return microscope, grid, sample, reconstruction_z, centers, truth, schedule
 
@@ -133,10 +139,26 @@ class RecordedSLM(correction.SimulatedSLM):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.acquisition_seconds = []
+        self.read_sigma_e = 0.
+        self.checkerboard_e = 0.
+        self.background_e = 0.
 
-    def acquire(self, *args, **kwargs):
+    def acquire(self, focal_z_levels, diversities=None):
         started = perf_counter()
-        result = super().acquire(*args, **kwargs)
+        if not (self.read_sigma_e or self.checkerboard_e or self.background_e):
+            result = super().acquire(focal_z_levels, diversities)
+        else:
+            from systematic_testing.noise_robustness.camera_noise import simulate_camera
+            clean = self.microscope.compute_image_3D(
+                self.sample, self._residual(), focal_z_levels, mode=self.optical_mode, diversities=diversities)[3]
+            observation = simulate_camera(self.exposure*np.maximum(clean, 0),
+                read_sigma_e=self.read_sigma_e, background_e=self.background_e, pattern='checkerboard',
+                offset_pattern_e=self.checkerboard_e,
+                poisson_seed=int(self.rng.integers(2**32)),
+                read_seed=int(self.rng.integers(2**32)))
+            result = observation['pedestal_only_e']/self.exposure
+            self.images_taken += len(result)
+            self.photons_detected += int(observation['signal_counts'].sum())
         self.acquisition_seconds.append(perf_counter()-started)
         return result
 
@@ -211,26 +233,33 @@ def export_correction_preview(output, simulator, config, rms_index):
     states = []
     for loop in range(1, 4):
         with np.load(output/f'loop_{loop}_input.npz', allow_pickle=False) as saved:
-            states.append(saved['images'][-36:][np.arange(4)*9+1])
+            fresh = len(FOCAL_Z)*(int(config.shared_zero)+3*len(config.diversity_settings))
+            zero = 0 if config.shared_zero else list(config.diversity_settings).index(0.)
+            states.append(saved['images'][-fresh:][np.arange(4)*(fresh//4)+zero])
     print('Preparing four-state correction preview (outside core timing)', flush=True)
     clean = simulator.microscope.compute_image_3D(
         simulator.sample, simulator._residual(), FOCAL_Z, mode='vector')[3]
     rng = np.random.default_rng(np.random.SeedSequence(
         [1, rms_index, config.beads, config.trial, 9902]))
-    states.append(rng.poisson(simulator.exposure*np.maximum(clean, 0))/simulator.exposure)
+    from systematic_testing.noise_robustness.camera_noise import simulate_camera
+    diagnostic = simulate_camera(simulator.exposure*np.maximum(clean, 0),
+        read_sigma_e=config.read_sigma_e, background_e=config.background_e, pattern='checkerboard',
+        offset_pattern_e=config.checkerboard_e,
+        poisson_seed=int(rng.integers(2**32)), read_seed=int(rng.integers(2**32)))
+    states.append(diagnostic['pedestal_only_e']/simulator.exposure)
     save_npz(output/'correction_preview.npz', images=np.stack(states, axis=1),
              focal_z=FOCAL_Z, final_state_is_simulated=True)
     return perf_counter()-started
 
 
-def run_demo(config, output):
+def run_demo(config, output, *, prepare_only=False):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     wall_start = perf_counter()
     metadata = dict(status='running', created_utc=datetime.now(timezone.utc).isoformat(),
                     config=asdict(config), microscope=dict(MICROSCOPE, grid_bfp=config.pupil_size),
                     focal_positions_mm=FOCAL_Z, diversity_modes_by_loop=DIVERSITY_MODES_BY_LOOP,
-                    diversity_rms_waves=DIVERSITY_RMS, num_ao_loops=3,
+                    diversity_rms_waves=config.diversity_settings, num_ao_loops=3,
                     correction_gain=1., max_modal_update=.10, reuse_acquisitions=True,
                     python=platform.python_version(), numpy=np.__version__,
                     hostname=platform.node(), slurm_job_id=os.environ.get('SLURM_JOB_ID'), loops=[])
@@ -239,7 +268,7 @@ def run_demo(config, output):
     write_json(output/'run.json', metadata)
     try:
         synchronize = lambda: None
-        if config.backend == 'cuda':
+        if config.backend == 'cuda' and not prepare_only:
             from optimization.reconstruction_cuda import _cupy
             cp = _cupy()
             synchronize = cp.cuda.get_current_stream().synchronize
@@ -259,7 +288,12 @@ def run_demo(config, output):
         simulator = RecordedSLM(microscope, sample, truth, MODES, exposure,
             np.random.default_rng(np.random.SeedSequence([1, rms_index, config.beads, config.trial])),
             optical_mode='vector')
-        metadata.update(exposure=exposure, alpha=microscope.alpha,
+        simulator.read_sigma_e = config.read_sigma_e
+        simulator.checkerboard_e = config.checkerboard_e
+        simulator.background_e = config.background_e
+        frames_per_loop = len(FOCAL_Z)*len(schedule[0])
+        metadata.update(frames_per_loop=frames_per_loop, noise_model='signal/background poisson + gaussian read + fixed checkerboard',
+                        exposure=exposure, alpha=microscope.alpha,
                         actual_initial_rms=zernike.zernike_RMS(truth, microscope.alpha),
                         preparation_seconds=perf_counter()-preparation_start,
                         timing_note='Synchronized host wall time; no full-workload warmup. '
@@ -270,6 +304,19 @@ def run_demo(config, output):
                  sample=sample.image_mask, sample_z=sample.z_levels,
                  reconstruction_z=sample_z, x=grid.get_xy()[0], y=grid.get_xy()[1],
                  calibration_image=calibration, alpha=microscope.alpha)
+        if prepare_only:
+            focal_z = np.repeat(FOCAL_Z, len(schedule[0]))
+            probes = schedule[0]*len(FOCAL_Z)
+            images = simulator.acquire(focal_z, probes)
+            save_npz(output/'loop_1_input.npz', images=images, focal_z=focal_z,
+                     sample_z=sample_z,
+                     diversity_strengths=np.array([coefficients(a) for a in probes]),
+                     acquisition_slm_strengths=simulator.slm_strengths.copy())
+            metadata.update(status='prepared', preview_only=True,
+                            acquisition_seconds=simulator.acquisition_seconds,
+                            wall_seconds=perf_counter()-wall_start)
+            write_json(output/'run.json', metadata)
+            return metadata
         records, timings = [], []
 
         def timed_optimizer(**kwargs):
@@ -311,7 +358,7 @@ def run_demo(config, output):
             if screening:
                 timing['screening'] = {key: screening[key] for key in (
                     'method', 'batch_size', 'refined_candidates', 'selected_index')}
-                for key in ('linear_frequencies', 'svd_fallback_frequencies'):
+                for key in ('fallback', 'linear_frequencies', 'qr_frequencies', 'svd_fallback_frequencies'):
                     if key in screening:
                         timing['screening'][key] = screening[key]
                 save_npz(output/f'loop_{loop}_screening.npz',
@@ -342,17 +389,19 @@ def run_demo(config, output):
                   (f' {event["fit_images"]} cumulative images' if 'fit_images' in event else ''), flush=True)
 
         history = correction.stack_feedback(
-            simulator, grid, sample_z, FOCAL_Z, [-2, 2], DIVERSITY_RMS,
-            config.rho, 108, gain=1., max_update=.10, diversity_schedule=schedule,
+            simulator, grid, sample_z, FOCAL_Z, [-2, 2], config.diversity_settings,
+            config.rho, 3*frames_per_loop, gain=1., max_update=.10, diversity_schedule=schedule,
             diversity_strategy='joint', reuse_acquisitions=True, optimizer=timed_optimizer,
             optimizer_kwargs=dict(method='newton', max_iterations=config.max_iterations,
                 num_random_starts=config.random_starts, random_start_rms_range=(.005, .50),
                 random_start_seed=0, verbose=False, show_initialization_progress=False),
             on_progress=progress, on_update=checkpoint)
-        if len(history) != 4 or [t['fit_images'] for t in timings] != [36, 72, 108]:
+        if len(history) != 4 or [t['fit_images'] for t in timings] != [frames_per_loop*i for i in (1, 2, 3)]:
             raise RuntimeError('The cumulative three-loop acquisition did not complete.')
-        metadata['object_replay_and_export_seconds'] = replay_objects(
-            output, config, microscope, grid, records, synchronize)
+        metadata['object_replay_and_export_seconds'] = 0.
+        if config.save_objects:
+            metadata['object_replay_and_export_seconds'] = replay_objects(
+                output, config, microscope, grid, records, synchronize)
         metadata['correction_preview_seconds'] = export_correction_preview(
             output, simulator, config, rms_index)
         metadata.update(status='complete', wall_seconds=perf_counter()-wall_start,
@@ -378,17 +427,29 @@ def main():
         parser.add_argument('--'+key.replace('_', '-'), type=int, default=getattr(DemoConfig(), key))
     for key in ('initial_rms', 'snr', 'rho'):
         parser.add_argument('--'+key.replace('_', '-'), type=float, default=getattr(DemoConfig(), key))
+    parser.add_argument('--diversity-settings', type=float, nargs='+', default=DemoConfig().diversity_settings)
+    parser.add_argument('--shared-zero', action='store_true')
+    parser.add_argument('--read-sigma-e', type=float, default=0.)
+    parser.add_argument('--background-e', type=float, default=0.)
+    parser.add_argument('--checkerboard-e', type=float, default=0.)
     parser.add_argument('--backend', choices=('cuda', 'cpu'), default='cuda')
+    parser.add_argument('--prepare-only', action='store_true', help='Generate exact first-loop noisy inputs without fitting or CUDA startup.')
+    parser.add_argument('--save-objects', action='store_true', help='Also export 3D object estimates; image/wavefront replay does not need them.')
     args = vars(parser.parse_args())
     output = args.pop('output')
+    prepare_only = args.pop('prepare_only')
     if any(args[key] < (2 if key in ('size', 'pupil_size', 'sample_planes', 'reconstruction_planes') else 1)
-           for key in args if isinstance(args[key], int) and key not in ('trial', 'random_starts')):
+           for key in args if type(args[key]) is int and key not in ('trial', 'random_starts')):
         parser.error('sizes must be positive; spatial and axial grids need at least two samples')
     if args['trial'] < 0 or args['random_starts'] < 0:
         parser.error('trial and random-starts must be nonnegative')
     if any(not np.isfinite(args[key]) or args[key] <= 0 for key in ('initial_rms', 'snr', 'rho')):
         parser.error('RMS, SNR and rho must be finite and positive')
-    run_demo(DemoConfig(**args), output)
+    if any(not np.isfinite(args[k]) or args[k] < 0 for k in ('read_sigma_e', 'checkerboard_e', 'background_e')):
+        parser.error('Noise amplitudes must be finite and nonnegative')
+    if not np.all(np.isfinite(args['diversity_settings'])):
+        parser.error('Diversity settings must be finite')
+    run_demo(DemoConfig(**args), output, prepare_only=prepare_only)
 
 
 if __name__ == '__main__':
